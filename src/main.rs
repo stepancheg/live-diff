@@ -9,6 +9,7 @@ mod interval_arg;
 mod lines_with_wrapped_row_count;
 mod mark;
 mod notify_pair;
+mod pr_diff;
 mod render;
 mod repo;
 mod search;
@@ -33,10 +34,13 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
+use crate::capture::CaptureSpec;
 use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyTx;
+use crate::pr_diff::github_pr_diff_command;
+use crate::pr_diff::origin_pr_diff_command;
 use crate::render::terminal_size;
 use crate::repo::repo::DEFAULT_CONTEXT;
 use crate::repo::repo::DiffTool;
@@ -63,14 +67,50 @@ struct Args {
 
     /// Revision to compare the working copy against.
     /// Without this flag, run the tool's default diff.
-    #[clap(short = 'r', long = "rev", conflicts_with = "commit")]
+    #[clap(
+        short = 'r',
+        long = "rev",
+        conflicts_with = "commit",
+        conflicts_with = "origin_pr",
+        conflicts_with = "github_pr"
+    )]
     rev: Option<String>,
 
     /// Show this commit's message and diff (`sl show`, `git show`).
     /// The commit is immutable, so the diff is captured once and not
     /// refreshed on an interval.
-    #[clap(short = 'c', long = "change", conflicts_with = "rev")]
+    #[clap(
+        short = 'c',
+        long = "change",
+        conflicts_with = "rev",
+        conflicts_with = "origin_pr",
+        conflicts_with = "github_pr"
+    )]
     commit: Option<String>,
+
+    /// Show Origin pull request N (`origin pr diff N`). Fetched once;
+    /// not refreshed on an interval.
+    #[clap(
+        long,
+        conflicts_with = "github_pr",
+        conflicts_with = "rev",
+        conflicts_with = "commit",
+        conflicts_with = "sl",
+        conflicts_with = "git"
+    )]
+    origin_pr: Option<u64>,
+
+    /// Show GitHub pull request N (`gh pr diff N`). Fetched once;
+    /// not refreshed on an interval.
+    #[clap(
+        long,
+        conflicts_with = "origin_pr",
+        conflicts_with = "rev",
+        conflicts_with = "commit",
+        conflicts_with = "sl",
+        conflicts_with = "git"
+    )]
+    github_pr: Option<u64>,
 
     /// Initial unified-diff context lines. `u` / `U` change it later.
     #[clap(short = 'U', long = "unified", default_value_t = DEFAULT_CONTEXT)]
@@ -88,15 +128,7 @@ fn install_panic_hook() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let tool = if args.sl {
-        DiffTool::Sl
-    } else if args.git {
-        DiffTool::Git
-    } else {
-        diff_tool()?
-    };
-    let rev = args.rev;
-    let commit = args.commit;
+    let spec = capture_spec(&args)?;
     let context = Arc::new(AtomicU32::new(args.context.min(MAX_CONTEXT)));
     let history = History::load_from_home().await;
 
@@ -105,10 +137,8 @@ async fn main() -> anyhow::Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
-        tool,
+        spec,
         Arc::clone(&context),
-        rev,
-        commit,
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
@@ -133,6 +163,38 @@ async fn main() -> anyhow::Result<()> {
     EventLoop::new(terminal_bg, history, size, context)
         .run(first_lines, output_rx, keys, refresh_tx, capture_task)
         .await
+}
+
+/// PR diffs do not need a local repository. A working-copy or commit
+/// diff does, and that is when the sl/git tool is resolved.
+fn capture_spec(args: &Args) -> anyhow::Result<CaptureSpec> {
+    if let Some(number) = args.origin_pr {
+        return Ok(CaptureSpec::Fixed {
+            command: origin_pr_diff_command(number),
+        });
+    }
+    if let Some(number) = args.github_pr {
+        return Ok(CaptureSpec::Fixed {
+            command: github_pr_diff_command(number),
+        });
+    }
+    let tool = if args.sl {
+        DiffTool::Sl
+    } else if args.git {
+        DiffTool::Git
+    } else {
+        diff_tool()?
+    };
+    if let Some(commit) = &args.commit {
+        return Ok(CaptureSpec::Commit {
+            tool,
+            commit: commit.clone(),
+        });
+    }
+    Ok(CaptureSpec::Live {
+        tool,
+        rev: args.rev.clone(),
+    })
 }
 
 fn spawn_key_reader(
@@ -200,6 +262,50 @@ mod tests {
         assert_eq!(Some(String::from("main")), args.rev);
         let args = Args::try_parse_from(["live-diff"]).unwrap();
         assert_eq!(None, args.rev);
+    }
+
+    #[test]
+    fn test_origin_pr_flag_parses() {
+        let args = Args::try_parse_from(["live-diff", "--origin-pr", "41"]).unwrap();
+        assert_eq!(Some(41), args.origin_pr);
+        assert_eq!(None, args.github_pr);
+        let spec = crate::capture_spec(&args).unwrap();
+        match spec {
+            crate::capture::CaptureSpec::Fixed { command } => {
+                assert_eq!(crate::pr_diff::origin_pr_diff_command(41), command);
+            }
+            crate::capture::CaptureSpec::Live { .. } => panic!("expected fixed command"),
+            crate::capture::CaptureSpec::Commit { .. } => panic!("expected fixed command"),
+        }
+    }
+
+    #[test]
+    fn test_github_pr_flag_parses() {
+        let args = Args::try_parse_from(["live-diff", "--github-pr", "41"]).unwrap();
+        assert_eq!(Some(41), args.github_pr);
+        assert_eq!(None, args.origin_pr);
+        let spec = crate::capture_spec(&args).unwrap();
+        match spec {
+            crate::capture::CaptureSpec::Fixed { command } => {
+                assert_eq!(crate::pr_diff::github_pr_diff_command(41), command);
+            }
+            crate::capture::CaptureSpec::Live { .. } => panic!("expected fixed command"),
+            crate::capture::CaptureSpec::Commit { .. } => panic!("expected fixed command"),
+        }
+    }
+
+    #[test]
+    fn test_pr_flags_conflict_with_each_other_and_rev() {
+        let err = Args::try_parse_from(["live-diff", "--origin-pr", "1", "--github-pr", "2"])
+            .unwrap_err();
+        assert_eq!(true, err.to_string().contains("--origin-pr"));
+        let err =
+            Args::try_parse_from(["live-diff", "--origin-pr", "1", "-r", "main"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--origin-pr"));
+        let err = Args::try_parse_from(["live-diff", "--github-pr", "1", "-c", "abc"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--github-pr"));
+        let err = Args::try_parse_from(["live-diff", "--origin-pr", "1", "--sl"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--origin-pr"));
     }
 
     #[test]

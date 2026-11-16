@@ -66,7 +66,11 @@ async fn capture_interruptible(
         .args(args)
         .stdin(Stdio::null())
         .kill_on_drop(true)
-        .process_group(0);
+        .process_group(0)
+        // `origin` warns and `gh` colorizes when FORCE_COLOR is set,
+        // even though stdout is a pipe. Drop it so the captured diff
+        // is plain text.
+        .env_remove("FORCE_COLOR");
     if combine_stderr {
         let stderr_writer = writer.try_clone()?;
         child_cmd.stdout(writer).stderr(stderr_writer);
@@ -139,29 +143,51 @@ enum CachedUntracked {
     Ok(Vec<u8>),
 }
 
+/// What the capture loop should run.
+pub(crate) enum CaptureSpec {
+    /// Working-copy diff (optional `rev`). Polled on an interval.
+    /// Untracked files are listed with each snapshot.
+    Live { tool: DiffTool, rev: Option<String> },
+    /// One commit (`sl show` / `git show`). No interval poll and no
+    /// untracked listing. `u`/`U` and `r` still re-run via refresh.
+    Commit { tool: DiffTool, commit: String },
+    /// A fixed command, such as a pull-request diff. Same once-only
+    /// behavior as [`CaptureSpec::Commit`]. The context size is not
+    /// part of the command.
+    Fixed { command: Vec<String> },
+}
+
 /// Capture in a loop, sending each snapshot on `tx`.
 /// `refresh` kills the current command and starts the next run at once.
 pub(crate) async fn capture_command_output_loop(
-    tool: DiffTool,
+    spec: CaptureSpec,
     context: Arc<AtomicU32>,
-    rev: Option<String>,
-    commit: Option<String>,
     interval: Duration,
     tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
-    // A single commit's diff is immutable. Do not poll, and do not
-    // list untracked files (those belong to the working copy). `u`/`U`
-    // and `r` still re-run via `refresh`.
-    let live = commit.is_none();
+    // A commit or PR diff is not the working copy. Do not poll, and do
+    // not list untracked files. `u`/`U` and `r` still re-run via
+    // `refresh`.
+    let live = match &spec {
+        CaptureSpec::Live { .. } => true,
+        CaptureSpec::Commit { .. } => false,
+        CaptureSpec::Fixed { .. } => false,
+    };
     let mut cached: Option<CachedSnapshot> = None;
     loop {
-        let command = command_for_tool(
-            tool,
-            context.load(Ordering::SeqCst),
-            rev.as_deref(),
-            commit.as_deref(),
-        );
+        let command = match &spec {
+            CaptureSpec::Live { tool, rev } => {
+                command_for_tool(*tool, context.load(Ordering::SeqCst), rev.as_deref(), None)
+            }
+            CaptureSpec::Commit { tool, commit } => command_for_tool(
+                *tool,
+                context.load(Ordering::SeqCst),
+                None,
+                Some(commit.as_str()),
+            ),
+            CaptureSpec::Fixed { command } => command.clone(),
+        };
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let diff = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
@@ -173,21 +199,23 @@ pub(crate) async fn capture_command_output_loop(
         };
         // A failed listing leaves the diff without untracked paths.
         // An interrupt restarts the whole snapshot so the count matches it.
-        let untracked = if live {
-            let untracked_cmd = untracked_command_for_tool(tool);
-            match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
-                Ok(CaptureOutcome::Interrupted) => continue,
-                Ok(CaptureOutcome::Done { bytes, success }) => {
-                    if success {
-                        CachedUntracked::Ok(bytes)
-                    } else {
-                        CachedUntracked::Failed
+        let untracked = match &spec {
+            CaptureSpec::Live { tool, .. } => {
+                let untracked_cmd = untracked_command_for_tool(*tool);
+                match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
+                    Ok(CaptureOutcome::Interrupted) => continue,
+                    Ok(CaptureOutcome::Done { bytes, success }) => {
+                        if success {
+                            CachedUntracked::Ok(bytes)
+                        } else {
+                            CachedUntracked::Failed
+                        }
                     }
+                    Err(_) => CachedUntracked::Failed,
                 }
-                Err(_) => CachedUntracked::Failed,
             }
-        } else {
-            CachedUntracked::Ok(Vec::new())
+            CaptureSpec::Commit { .. } => CachedUntracked::Ok(Vec::new()),
+            CaptureSpec::Fixed { .. } => CachedUntracked::Ok(Vec::new()),
         };
         let unchanged = match &cached {
             Some(prev) => {

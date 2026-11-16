@@ -12,6 +12,7 @@ Sapling is used when the repository already has sl metadata (`.sl` or
 ## Features
 
 - Git and Sapling
+- Origin and GitHub pull request diffs
 - Live refresh that keeps the scroll position
 - Pinned file header
 - Untracked files on the status bar and in the diff stat
@@ -48,6 +49,8 @@ or `bin/live-diff`
 | `-n`, `--interval` | Seconds between runs (default `0.5`, or `LIVE_DIFF_INTERVAL`) |
 | `-r`, `--rev` | Revision to compare against. Without this, the tool's default diff |
 | `-c`, `--change` | Commit message and diff for one commit. No live refresh |
+| `--origin-pr N` | Origin PR diff (`origin pr diff N`). No live refresh |
+| `--github-pr N` | GitHub PR diff (`gh pr diff N`). No live refresh |
 | `-U`, `--unified` | Initial context lines (default 3). `u` / `U` change it later |
 | `--sl` | Force `sl diff` |
 | `--git` | Force `git diff` |
