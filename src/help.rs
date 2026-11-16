@@ -28,6 +28,7 @@ Keys
 
 q or h closes this page.
 In the diff stat, j/k move, Enter or s goes to the file, Esc returns, q quits.
+Untracked files are listed after the stat.
 In the prompt, Enter searches. Up and Down recall previous searches.
 Esc cancels the prompt or clears Pattern not found.
 ";
@@ -94,6 +95,10 @@ mod tests {
         assert_eq!(true, text.contains("u              Decrease context"));
         assert_eq!(true, text.contains("U              Increase context"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));
+        assert_eq!(
+            true,
+            text.contains("Untracked files are listed after the stat.")
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ use crate::notify_pair::NotifyTx;
 use crate::render::terminal_size;
 use crate::repo::DEFAULT_CONTEXT;
 use crate::repo::DiffTool;
+use crate::repo::MAX_CONTEXT;
 use crate::repo::diff_tool;
 use crate::search::history::store::History;
 use crate::terminal_bg::query_terminal_bg;
@@ -64,6 +65,10 @@ struct Args {
     /// Without this flag, run the tool's default diff.
     #[clap(short = 'r', long = "rev")]
     rev: Option<String>,
+
+    /// Initial unified-diff context lines. `u` / `U` change it later.
+    #[clap(short = 'U', long = "unified", default_value_t = DEFAULT_CONTEXT)]
+    context: u32,
 }
 
 fn install_panic_hook() {
@@ -85,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         diff_tool()?
     };
     let rev = args.rev;
-    let context = Arc::new(AtomicU32::new(DEFAULT_CONTEXT));
+    let context = Arc::new(AtomicU32::new(args.context.min(MAX_CONTEXT)));
     let history = History::load_from_home().await;
 
     // Capture the first snapshot on the primary screen so the alternate
@@ -187,6 +192,16 @@ mod tests {
         assert_eq!(Some(String::from("main")), args.rev);
         let args = Args::try_parse_from(["live-diff"]).unwrap();
         assert_eq!(None, args.rev);
+    }
+
+    #[test]
+    fn test_unified_flag_parses() {
+        let args = Args::try_parse_from(["live-diff"]).unwrap();
+        assert_eq!(crate::repo::DEFAULT_CONTEXT, args.context);
+        let args = Args::try_parse_from(["live-diff", "-U", "0"]).unwrap();
+        assert_eq!(0, args.context);
+        let args = Args::try_parse_from(["live-diff", "--unified", "12"]).unwrap();
+        assert_eq!(12, args.context);
     }
 }
 

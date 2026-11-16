@@ -19,11 +19,14 @@ use crate::diff::parse_diff;
 use crate::notify_pair::NotifyRx;
 use crate::repo::DiffTool;
 use crate::repo::command_for_tool;
+use crate::repo::parse_untracked_paths;
+use crate::repo::untracked_command_for_tool;
 
 /// Result of a capture that may be cut short by `interrupt`.
 pub(crate) enum CaptureOutcome {
     /// Child exited (or the pipe hit EOF) and output was collected.
-    Done(Vec<u8>),
+    /// `bytes` includes an `exit status: N` line when `success` is false.
+    Done { bytes: Vec<u8>, success: bool },
     /// `interrupt` fired. The child and its process group were killed.
     Interrupted,
 }
@@ -35,21 +38,43 @@ pub(crate) async fn capture_command_output_interruptible(
     command: &[String],
     interrupt: Option<&NotifyRx>,
 ) -> anyhow::Result<CaptureOutcome> {
+    capture_interruptible(command, interrupt, true).await
+}
+
+/// Like [`capture_command_output_interruptible`], but stderr is discarded
+/// so a NUL-separated stdout listing is not corrupted by diagnostics.
+async fn capture_stdout_interruptible(
+    command: &[String],
+    interrupt: Option<&NotifyRx>,
+) -> anyhow::Result<CaptureOutcome> {
+    capture_interruptible(command, interrupt, false).await
+}
+
+async fn capture_interruptible(
+    command: &[String],
+    interrupt: Option<&NotifyRx>,
+    combine_stderr: bool,
+) -> anyhow::Result<CaptureOutcome> {
     let Some((program, args)) = command.split_first() else {
         return Err(anyhow!("empty command"));
     };
-    // One pipe for both streams: the kernel keeps write order.
+    // One pipe for stdout (and stderr when combined): the kernel keeps
+    // write order.
     let (reader, writer) = io::pipe()?;
-    let stderr_writer = writer.try_clone()?;
     // Own process group so an interrupt can kill grandchildren too.
-    let mut child = tokio::process::Command::new(program)
+    let mut child_cmd = tokio::process::Command::new(program);
+    child_cmd
         .args(args)
         .stdin(Stdio::null())
-        .stdout(writer)
-        .stderr(stderr_writer)
         .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if combine_stderr {
+        let stderr_writer = writer.try_clone()?;
+        child_cmd.stdout(writer).stderr(stderr_writer);
+    } else {
+        child_cmd.stdout(writer).stderr(Stdio::null());
+    }
+    let mut child = child_cmd.spawn()?;
     // Tokio drives the read end. The child keeps a blocking write end.
     let reader = pipe::Receiver::from_owned_fd(OwnedFd::from(reader))?;
     let mut out = Vec::new();
@@ -66,8 +91,12 @@ pub(crate) async fn capture_command_output_interruptible(
                 match read_ready(&reader, &mut buf, &mut out)? {
                     ReadReady::Eof => {
                         let status = child.wait().await?;
+                        let success = status.success();
                         append_nonzero_status(&status, &mut out);
-                        return Ok(CaptureOutcome::Done(out));
+                        return Ok(CaptureOutcome::Done {
+                            bytes: out,
+                            success,
+                        });
                     }
                     ReadReady::Pending => {}
                 }
@@ -77,8 +106,12 @@ pub(crate) async fn capture_command_output_interruptible(
                 // Do not wait for EOF: a grandchild may still hold the write end.
                 // Drop the tokio registration and read whatever is already buffered.
                 drain_nonblocking(reader.into_nonblocking_fd()?, &mut out)?;
+                let success = status.success();
                 append_nonzero_status(&status, &mut out);
-                return Ok(CaptureOutcome::Done(out));
+                return Ok(CaptureOutcome::Done {
+                    bytes: out,
+                    success,
+                });
             }
         }
     }
@@ -97,14 +130,26 @@ pub(crate) async fn capture_command_output_loop(
     loop {
         let command = command_for_tool(tool, context.load(Ordering::SeqCst), rev.as_deref());
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
-        let output = match outcome {
+        let mut output = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
-            Ok(CaptureOutcome::Done(bytes)) => parse_diff(&bytes),
+            Ok(CaptureOutcome::Done { bytes, .. }) => parse_diff(&bytes),
             Err(err) => {
                 let text = format!("error: {err:?}");
                 DiffOutput::message(&text)
             }
         };
+        // A failed listing leaves the diff without untracked paths.
+        // An interrupt restarts the whole snapshot so the count matches it.
+        let untracked_cmd = untracked_command_for_tool(tool);
+        match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
+            Ok(CaptureOutcome::Interrupted) => continue,
+            Ok(CaptureOutcome::Done { bytes, success }) => {
+                if success {
+                    output.set_untracked(parse_untracked_paths(&bytes));
+                }
+            }
+            Err(_) => {}
+        }
         if tx.send(output).await.is_err() {
             return;
         }
@@ -215,7 +260,7 @@ mod tests {
 
     async fn capture_command_output(command: &[String]) -> anyhow::Result<Vec<u8>> {
         match capture_command_output_interruptible(command, None).await? {
-            CaptureOutcome::Done(bytes) => Ok(bytes),
+            CaptureOutcome::Done { bytes, .. } => Ok(bytes),
             CaptureOutcome::Interrupted => Err(anyhow::anyhow!("capture interrupted")),
         }
     }

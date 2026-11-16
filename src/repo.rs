@@ -37,6 +37,44 @@ pub(crate) fn command_for_tool(tool: DiffTool, context: u32, rev: Option<&str>) 
     }
 }
 
+/// List untracked, non-ignored paths. Output is NUL-separated and
+/// relative to the repository root.
+pub(crate) fn untracked_command_for_tool(tool: DiffTool) -> Vec<String> {
+    match tool {
+        DiffTool::Sl => vec![
+            String::from("sl"),
+            String::from("status"),
+            String::from("-u"),
+            String::from("-n"),
+            String::from("-0"),
+            String::from("--root-relative"),
+        ],
+        DiffTool::Git => vec![
+            String::from("git"),
+            String::from("ls-files"),
+            String::from("--others"),
+            String::from("--exclude-standard"),
+            String::from("--full-name"),
+            String::from("-z"),
+        ],
+    }
+}
+
+/// Parse NUL-separated paths from [`untracked_command_for_tool`].
+/// The result is sorted and deduplicated.
+pub(crate) fn parse_untracked_paths(bytes: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for part in bytes.split(|b| *b == 0) {
+        if part.is_empty() {
+            continue;
+        }
+        paths.push(String::from_utf8_lossy(part).into_owned());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 pub(crate) fn sl_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
     let mut cmd = vec![
         String::from("sl"),
@@ -159,6 +197,57 @@ mod tests {
         assert_eq!(
             crate::repo::MAX_CONTEXT,
             crate::repo::step_context(crate::repo::MAX_CONTEXT, true)
+        );
+    }
+
+    #[test]
+    fn test_untracked_command_argv() {
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("status"),
+                String::from("-u"),
+                String::from("-n"),
+                String::from("-0"),
+                String::from("--root-relative"),
+            ],
+            crate::repo::untracked_command_for_tool(crate::repo::DiffTool::Sl)
+        );
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("ls-files"),
+                String::from("--others"),
+                String::from("--exclude-standard"),
+                String::from("--full-name"),
+                String::from("-z"),
+            ],
+            crate::repo::untracked_command_for_tool(crate::repo::DiffTool::Git)
+        );
+    }
+
+    #[test]
+    fn test_parse_untracked_paths_sorts_and_skips_empty() {
+        assert_eq!(
+            Vec::<String>::new(),
+            crate::repo::parse_untracked_paths(b"")
+        );
+        assert_eq!(
+            Vec::<String>::new(),
+            crate::repo::parse_untracked_paths(b"\0")
+        );
+        assert_eq!(
+            vec![
+                String::from("a/b"),
+                String::from("file with space"),
+                String::from("z"),
+            ],
+            crate::repo::parse_untracked_paths(b"z\0a/b\0file with space\0\0z\0")
+        );
+        // A newline inside a path is preserved because the separator is NUL.
+        assert_eq!(
+            vec![String::from("a\nb")],
+            crate::repo::parse_untracked_paths(b"a\nb\0")
         );
     }
 

@@ -47,6 +47,10 @@ pub(crate) struct Renderer {
     status_label: Option<String>,
     /// Caret column in `status_label`. `None` means the end of the label.
     status_caret: Option<u32>,
+    /// Persistent note drawn just left of the ruler (untracked count).
+    /// Kept across [`Renderer::set_status_label`] so search and context
+    /// messages do not hide it.
+    status_note: Option<String>,
     /// Compiled search regex whose matches are drawn with a search highlight.
     highlight: Option<Highlight>,
     /// Bumped when body rows may have changed (`set_lines` / highlight).
@@ -116,6 +120,7 @@ impl Renderer {
             terminal_bg,
             status_label: None,
             status_caret: None,
+            status_note: None,
             highlight: None,
             content_gen: 0,
             size,
@@ -163,6 +168,20 @@ impl Renderer {
     pub(crate) fn set_status_label(&mut self, label: Option<String>) {
         self.status_label = label;
         self.status_caret = None;
+    }
+
+    pub(crate) fn set_status_note(&mut self, note: Option<String>) {
+        self.status_note = note;
+    }
+
+    /// Right-hand status cluster: the optional note, a space, and the ruler.
+    /// The note is dropped when it would not fit beside the ruler.
+    fn status_right(&self, ruler: &str) -> String {
+        compose_status_right(
+            self.status_note.as_deref().unwrap_or(""),
+            ruler,
+            self.size.width,
+        )
     }
 
     pub(crate) fn status_label(&self) -> Option<&str> {
@@ -577,12 +596,13 @@ impl Renderer {
             Some(_) => start,
         };
         let ruler = viewport_ruler(ruler_top, end, total);
-        let ruler_cols = display_width(&ruler).0.min(size.width.0);
-        // Keep one column between the label and the ruler when both fit.
-        let label_cols = if ruler_cols == 0 {
+        let right = self.status_right(&ruler);
+        let right_cols = cmp::min(display_width(&right).0, size.width.0);
+        // Keep one column between the label and the right-hand cluster.
+        let label_cols = if right_cols == 0 {
             size.width.0
         } else {
-            size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
+            size.width.0.saturating_sub(right_cols).saturating_sub(1)
         };
         let visible = self.visible_rows(&layout);
         let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
@@ -595,7 +615,7 @@ impl Renderer {
             }
             None => (String::new(), 0),
         };
-        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &ruler);
+        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &right);
         let unchanged = match &self.drawn {
             Some(drawn) => {
                 !force
@@ -645,11 +665,12 @@ impl Renderer {
     /// Repaint only the status row and cursor. Body rows stay as they are.
     fn paint_status(&mut self, out: &mut impl Write, ruler: &str) -> io::Result<()> {
         let size = self.size;
-        let ruler_cols = display_width(ruler).0.min(size.width.0);
-        let label_cols = if ruler_cols == 0 {
+        let right = self.status_right(ruler);
+        let right_cols = cmp::min(display_width(&right).0, size.width.0);
+        let label_cols = if right_cols == 0 {
             size.width.0
         } else {
-            size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
+            size.width.0.saturating_sub(right_cols).saturating_sub(1)
         };
         let show_cursor = self.status_caret.is_some();
         let (label, caret) = match &self.status_label {
@@ -659,7 +680,7 @@ impl Renderer {
             }
             None => (String::new(), 0),
         };
-        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, ruler);
+        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &right);
         let unchanged = match &self.drawn {
             Some(drawn) => {
                 drawn.status == status && drawn.caret == caret && drawn.cursor == show_cursor
@@ -1024,6 +1045,27 @@ fn row_fingerprint(row: &VisualRow) -> String {
         s.push_str(&piece.text);
     }
     s
+}
+
+/// `note` sits just left of `ruler` when both fit in `width`.
+fn compose_status_right(note: &str, ruler: &str, width: Width) -> String {
+    let ruler_cols = display_width(ruler).0;
+    if ruler_cols >= width.0 {
+        return take_prefix_cols(ruler, width);
+    }
+    if note.is_empty() {
+        return ruler.to_owned();
+    }
+    let note_cols = display_width(note).0;
+    // note + separating space + ruler
+    let needed = note_cols.saturating_add(1).saturating_add(ruler_cols);
+    if needed <= width.0 {
+        let mut s = String::from(note);
+        s.push(' ');
+        s.push_str(ruler);
+        return s;
+    }
+    ruler.to_owned()
 }
 
 fn status_bar_fingerprint(
@@ -1846,6 +1888,36 @@ mod tests {
     }
 
     #[test]
+    fn test_draw_skips_when_file_list_rebuilt_unchanged() {
+        // A stat-page refresh rebuilds the rows and calls draw. Identical
+        // rows must not clear the screen (that drops a text selection).
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-a
++b
+";
+        let output = crate::diff::parse_diff(input);
+        let files = output.files();
+        let width = crate::terminal::width::Width(40);
+        let lines = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width);
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 10));
+        renderer.set_lines(lines);
+        renderer.set_status_label(Some(String::from("Enter: go to file")));
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        assert_eq!(false, buf.is_empty());
+        buf.clear();
+        let again = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width);
+        renderer.set_lines(again);
+        renderer.set_status_label(Some(String::from("Enter: go to file")));
+        renderer.draw(&mut buf).unwrap();
+        assert_eq!(true, buf.is_empty());
+    }
+
+    #[test]
     fn test_search_highlight_sets_bg() {
         let size = size(20, 3);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
@@ -1905,6 +1977,26 @@ mod tests {
         assert_eq!("       Top", row_text(&parser, 2, 10));
         let cell = parser.screen().cell(2, 0).unwrap();
         assert_eq!(vt100::Color::Idx(8), cell.bgcolor());
+    }
+
+    #[test]
+    fn test_status_bar_shows_untracked_note() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(28, 2));
+        renderer.set_lines(parse_command_output(b"a\n"));
+        renderer.set_status_note(Some(String::from("3 untracked")));
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(2, 28);
+        parser.process(&buf);
+        // Right-aligned: note, space, ruler. "3 untracked Bot" is 15 cols.
+        assert_eq!("             3 untracked Bot", row_text(&parser, 1, 28));
+        // A left-hand label stays on the left; the note stays by the ruler.
+        renderer.set_status_label(Some(String::from("context 3")));
+        buf.clear();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(2, 28);
+        parser.process(&buf);
+        assert_eq!("context 3    3 untracked Bot", row_text(&parser, 1, 28));
     }
 
     #[test]

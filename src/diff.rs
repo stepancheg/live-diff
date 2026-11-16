@@ -51,9 +51,13 @@ pub(crate) enum HunkLineKind {
 
 /// Command output as structured file diffs plus any non-diff lines,
 /// in the order they appeared.
+///
+/// `untracked` is filled in by the capture loop (not by [`parse_diff`]):
+/// working-copy paths that are not tracked and not ignored.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiffOutput {
     segments: Vec<Segment>,
+    untracked: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,7 +109,23 @@ impl DiffOutput {
         for line in split_raw_lines(text.as_bytes()) {
             segments.push(Segment::Text(line.raw));
         }
-        DiffOutput { segments }
+        DiffOutput {
+            segments,
+            untracked: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_untracked(&mut self, untracked: Vec<String>) {
+        self.untracked = untracked;
+    }
+
+    pub(crate) fn untracked(&self) -> &[String] {
+        &self.untracked
+    }
+
+    /// Rows on the diff-stat page: changed files, then untracked paths.
+    pub(crate) fn stat_row_count(&self) -> usize {
+        self.files().len().saturating_add(self.untracked.len())
     }
 
     pub(crate) fn files(&self) -> Vec<&FileDiff> {
@@ -187,7 +207,10 @@ pub(crate) fn parse_diff(input: &[u8]) -> DiffOutput {
         segments.push(Segment::Text(raw_lines[i].raw.clone()));
         i += 1;
     }
-    DiffOutput { segments }
+    DiffOutput {
+        segments,
+        untracked: Vec::new(),
+    }
 }
 
 impl FileDiff {
@@ -212,12 +235,15 @@ impl FileDiff {
 /// `selected` is drawn with a grey / dark-grey background.
 pub(crate) fn file_list_lines(
     files: &[&FileDiff],
+    untracked: &[String],
     selected: usize,
     terminal_bg: crate::terminal_bg::TerminalBg,
     width: crate::terminal::width::Width,
 ) -> Vec<Line> {
     if files.is_empty() {
-        return vec![Line::from_styled("(no files)", diff_note_style())];
+        if untracked.is_empty() {
+            return vec![Line::from_styled("(no files)", diff_note_style())];
+        }
     }
     let cols = usize::try_from(width.0).unwrap_or(0);
     let names: Vec<String> = files.iter().map(|file| file_header_text(file)).collect();
@@ -232,11 +258,29 @@ pub(crate) fn file_list_lines(
     let num_w = decimal_width(max_change).max(if any_binary { 3 } else { 1 });
     // "> " / "  " plus " | " plus the count plus a space before the bar.
     let cursor_w = 2usize;
-    let fixed = cursor_w + 3 + num_w + 1;
+    // The count column is `num_w` plus a space. Untracked rows put the
+    // tag in that right-hand area, so reserve the tag width when any
+    // are present and the bar will sit in whatever is left.
+    let right_w = if untracked.is_empty() {
+        num_w + 1
+    } else {
+        let stat_right = num_w + 1;
+        if stat_right < UNTRACKED_TAG_WIDTH {
+            UNTRACKED_TAG_WIDTH
+        } else {
+            stat_right
+        }
+    };
+    let fixed = cursor_w + 3 + right_w;
     let remain = cols.saturating_sub(fixed);
     let max_name = names
         .iter()
         .map(|name| unicode_width::UnicodeWidthStr::width(name.as_str()))
+        .chain(
+            untracked
+                .iter()
+                .map(|name| unicode_width::UnicodeWidthStr::width(name.as_str())),
+        )
         .max()
         .unwrap_or(0);
     // Fit the longest path when possible and give the bar the rest.
@@ -250,7 +294,7 @@ pub(crate) fn file_list_lines(
         (remain - graph_w, graph_w)
     };
 
-    let mut lines = Vec::with_capacity(files.len());
+    let mut lines = Vec::with_capacity(files.len().saturating_add(untracked.len()));
     for (i, file) in files.iter().enumerate() {
         let selected_row = i == selected;
         let mut name_style = diff_file_header_style();
@@ -296,7 +340,69 @@ pub(crate) fn file_list_lines(
         }
         lines.push(line);
     }
+    // Untracked rows follow the stat and share its name column so `|`
+    // lines up.
+    for (j, path) in untracked.iter().enumerate() {
+        let selected_row = files.len().saturating_add(j) == selected;
+        push_untracked_list_row(&mut lines, path, selected_row, name_w, cols, terminal_bg);
+    }
     lines
+}
+
+const UNTRACKED_TAG: &str = "untracked";
+const UNTRACKED_TAG_WIDTH: usize = 9;
+
+fn push_untracked_list_row(
+    lines: &mut Vec<Line>,
+    path: &str,
+    selected_row: bool,
+    name_w: usize,
+    cols: usize,
+    terminal_bg: crate::terminal_bg::TerminalBg,
+) {
+    let cursor_w = 2usize;
+    let pipe_w = 3usize;
+    let overhead = cursor_w
+        .saturating_add(pipe_w)
+        .saturating_add(UNTRACKED_TAG_WIDTH);
+    let mut name_style = diff_file_header_style();
+    let mut plain_style = Style::plain();
+    let mut tag_style = diff_note_style();
+    if selected_row {
+        let bg = Some(terminal_bg.row_highlight());
+        name_style.bg = bg;
+        plain_style.bg = bg;
+        tag_style.bg = bg;
+    }
+    let mut line = Line::new();
+    line.push_styled(if selected_row { "> " } else { "  " }, name_style);
+    // Keep the tag when the row can hold cursor + pipe + tag.
+    // Shrink the name column if the aligned width would overflow.
+    if overhead <= cols {
+        let mut budget = name_w;
+        if overhead.saturating_add(budget) > cols {
+            budget = cols.saturating_sub(overhead);
+        }
+        let shown = fit_name(path, budget);
+        line.push_styled(&shown, name_style);
+        let pad = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(shown.as_str()));
+        if pad > 0 {
+            line.push_styled(&" ".repeat(pad), name_style);
+        }
+        line.push_styled(" | ", plain_style);
+        line.push_styled(UNTRACKED_TAG, tag_style);
+    } else {
+        let budget = cols.saturating_sub(cursor_w);
+        let shown = fit_name(path, budget);
+        line.push_styled(&shown, name_style);
+    }
+    if selected_row {
+        let used = usize::try_from(line.width().0).unwrap_or(0);
+        if used < cols {
+            line.push_styled(&" ".repeat(cols - used), plain_style);
+        }
+    }
+    lines.push(line);
 }
 
 fn decimal_width(n: u32) -> usize {
@@ -1516,6 +1622,7 @@ diff --git a/bar b/bar
         let files = output.files();
         let lines = crate::diff::file_list_lines(
             &files,
+            &[],
             1,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
@@ -1597,6 +1704,7 @@ diff --git a/much/longer/path.rs b/much/longer/path.rs
         let files = output.files();
         let lines = crate::diff::file_list_lines(
             &files,
+            &[],
             0,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(60),
@@ -1607,6 +1715,111 @@ diff --git a/much/longer/path.rs b/much/longer/path.rs
         // 4 deletes + 4 inserts on the long path; 1 and 1 on x.
         assert_eq!(true, b.contains(" | 8 "));
         assert_eq!(true, a.contains(" | 2 "));
+    }
+
+    #[test]
+    fn test_file_list_lines_appends_untracked() {
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-a
++b
+";
+        let output = parse_diff(input);
+        let files = output.files();
+        let untracked = vec![String::from("notes.txt"), String::from("tmp/scratch")];
+        let lines = crate::diff::file_list_lines(
+            &files,
+            &untracked,
+            2,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(48),
+        );
+        assert_eq!(3, lines.len());
+        let stat = lines[0].plain_text();
+        let first_u = lines[1].plain_text();
+        let second_u = lines[2].plain_text();
+        assert_eq!(true, stat.starts_with("  foo"));
+        assert_eq!(true, stat.contains(" | "));
+        assert_eq!(true, first_u.starts_with("  notes.txt"));
+        assert_eq!(true, first_u.contains(" | untracked"));
+        assert_eq!(true, second_u.starts_with("> tmp/scratch"));
+        assert_eq!(true, second_u.contains(" | untracked"));
+        // Pipe column matches the stat row.
+        assert_eq!(stat.find(" | "), first_u.find(" | "));
+        assert_eq!(stat.find(" | "), second_u.find(" | "));
+        assert_eq!(
+            true,
+            lines[2]
+                .spans
+                .iter()
+                .all(|s| s.style.bg == Some(crate::terminal::color::TerminalColor::Ansi256(8)))
+        );
+        assert_eq!(true, lines[1].spans.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn test_file_list_lines_are_stable() {
+        // The stat page skips a repaint when a refresh rebuilds equal
+        // lines. That equality is what keeps a text selection alive.
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1,2 @@
+-old
++new
++extra
+";
+        let output = parse_diff(input);
+        let files = output.files();
+        let untracked = vec![String::from("notes.txt")];
+        let a = crate::diff::file_list_lines(
+            &files,
+            &untracked,
+            1,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+        );
+        let b = crate::diff::file_list_lines(
+            &files,
+            &untracked,
+            1,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_file_list_lines_untracked_only() {
+        let lines = crate::diff::file_list_lines(
+            &[],
+            &[String::from("a.txt"), String::from("dir/b.txt")],
+            0,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+        );
+        assert_eq!(2, lines.len());
+        assert_eq!(true, lines[0].plain_text().starts_with("> a.txt"));
+        assert_eq!(true, lines[0].plain_text().contains(" | untracked"));
+        assert_eq!(true, lines[1].plain_text().starts_with("  dir/b.txt"));
+        assert_eq!(true, lines[1].plain_text().contains(" | untracked"));
+        assert_eq!(
+            lines[0].plain_text().find(" | "),
+            lines[1].plain_text().find(" | ")
+        );
+        let empty = crate::diff::file_list_lines(
+            &[],
+            &[],
+            0,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+        );
+        assert_eq!(1, empty.len());
+        assert_eq!("(no files)", empty[0].plain_text());
     }
 
     #[test]

@@ -199,6 +199,8 @@ impl EventLoop {
         self.retain_file_list_selection(&output);
         self.output = output.clone();
         self.renderer.set_diff(output);
+        self.renderer
+            .set_status_note(untracked_status_note(self.output.untracked().len()));
         for (name, mark_anchor) in mark_anchors {
             self.marks
                 .rows
@@ -215,7 +217,9 @@ impl EventLoop {
         }
         match self.mode {
             Mode::Help => {}
-            Mode::Files => self.draw_file_list()?,
+            // In-place refresh. `draw` skips the terminal write when the
+            // visible list is unchanged, so a text selection survives.
+            Mode::Files => self.paint_file_list(false)?,
             _ => self.renderer.draw(&mut io::stdout())?,
         }
         Ok(())
@@ -398,7 +402,8 @@ impl EventLoop {
         self.mode = Mode::Files;
         // Start with the current file at the top of the list.
         self.help_renderer.scroll_top();
-        self.draw_file_list()?;
+        // Screen still shows the diff; the redraw below paints the list.
+        self.paint_file_list(false)?;
         self.help_renderer.scroll_to_line(self.file_list_index);
         self.help_renderer.redraw(&mut io::stdout())?;
         Ok(KeyResult::Continue)
@@ -411,9 +416,15 @@ impl EventLoop {
     }
 
     fn open_selected_file(&mut self) -> anyhow::Result<KeyResult> {
-        let n = self.output.files().len();
-        if n > 0 {
-            let index = self.file_list_index.min(n - 1);
+        let n_files = self.output.files().len();
+        // Untracked rows have no diff to open; stay on the stat page.
+        if self.file_list_index >= n_files {
+            if self.file_list_index < self.output.stat_row_count() {
+                return Ok(KeyResult::Continue);
+            }
+        }
+        if n_files > 0 {
+            let index = self.file_list_index.min(n_files - 1);
             self.renderer.scroll_to_file(index);
             self.search.clear_match();
             self.search.apply_highlight(&mut self.renderer);
@@ -425,8 +436,22 @@ impl EventLoop {
     }
 
     fn draw_file_list(&mut self) -> anyhow::Result<()> {
+        // Selection moved, or the list is already on screen: repaint
+        // only if the frame actually changed.
+        self.paint_file_list(false)
+    }
+
+    /// Build the stat page and paint it.
+    ///
+    /// `force` must be set when the diff (or another view) was just
+    /// written to the screen: the help renderer's cache can still match
+    /// this list, and a non-forced draw would leave that other view up.
+    /// A refresh of an unchanged list does not write anything, so the
+    /// terminal text selection is kept.
+    fn paint_file_list(&mut self, force: bool) -> anyhow::Result<()> {
         let files = self.output.files();
-        let n = files.len();
+        let untracked = self.output.untracked();
+        let n = files.len().saturating_add(untracked.len());
         if n == 0 {
             self.file_list_index = 0;
         } else if self.file_list_index >= n {
@@ -434,31 +459,45 @@ impl EventLoop {
         }
         let lines = file_list_lines(
             &files,
+            untracked,
             self.file_list_index,
             self.help_renderer.terminal_bg(),
             self.size.width,
         );
+        let hint = if self.file_list_index >= files.len() {
+            if !untracked.is_empty() {
+                "untracked"
+            } else {
+                "Enter: go to file"
+            }
+        } else {
+            "Enter: go to file"
+        };
+        if !force {
+            let same_lines = self.help_renderer.lines() == lines.as_slice();
+            let same_label = self.help_renderer.status_label() == Some(hint);
+            if same_lines {
+                if same_label {
+                    return Ok(());
+                }
+            }
+        }
         self.help_renderer.set_lines(lines);
         self.help_renderer
-            .set_status_label(Some(String::from("Enter: go to file")));
+            .set_status_label(Some(String::from(hint)));
         self.help_renderer.ensure_line_visible(self.file_list_index);
-        self.help_renderer.redraw(&mut io::stdout())?;
+        if force {
+            self.help_renderer.redraw(&mut io::stdout())?;
+        } else {
+            self.help_renderer.draw(&mut io::stdout())?;
+        }
         Ok(())
     }
 
     fn retain_file_list_selection(&mut self, output: &DiffOutput) {
-        let old_labels: Vec<String> = self
-            .output
-            .files()
-            .iter()
-            .map(|file| crate::diff::file_header_text(file))
-            .collect();
+        let old_labels = stat_list_labels(&self.output);
         let selected = old_labels.get(self.file_list_index).cloned();
-        let new_labels: Vec<String> = output
-            .files()
-            .iter()
-            .map(|file| crate::diff::file_header_text(file))
-            .collect();
+        let new_labels = stat_list_labels(output);
         if let Some(label) = selected {
             if let Some(i) = new_labels.iter().position(|l| *l == label) {
                 self.file_list_index = i;
@@ -473,7 +512,7 @@ impl EventLoop {
     }
 
     fn move_file_selection(&mut self, target: usize) -> anyhow::Result<()> {
-        let n = self.output.files().len();
+        let n = self.output.stat_row_count();
         if n == 0 {
             self.file_list_index = 0;
         } else {
@@ -494,7 +533,7 @@ impl EventLoop {
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
         };
-        let n = self.output.files().len();
+        let n = self.output.stat_row_count();
         let page = list_page_size(self.size);
         match action {
             KeyAction::Quit => Ok(KeyResult::Quit),
@@ -515,8 +554,10 @@ impl EventLoop {
                 // next snapshot redraws the list.
                 let result = self.change_context(action)?;
                 self.mode = Mode::Files;
-                // change_context redrew the diff. Paint the list back.
-                self.draw_file_list()?;
+                // change_context redrew the diff. Paint the list back
+                // over it; the cached list frame would otherwise match
+                // and a non-forced draw would leave the diff up.
+                self.paint_file_list(true)?;
                 Ok(result)
             }
             KeyAction::ScrollDown => {
@@ -724,6 +765,29 @@ fn show_search_outcome(
     }
     renderer.redraw(&mut io::stdout())?;
     Ok(())
+}
+
+/// Status-bar note for the diff view. Hidden when there are none.
+fn untracked_status_note(count: usize) -> Option<String> {
+    if count == 0 {
+        None
+    } else {
+        Some(format!("{count} untracked"))
+    }
+}
+
+/// Identity of each diff-stat row, so a refresh can keep the same
+/// selection. Diff files and untracked paths use different prefixes
+/// because a path can match a header label.
+fn stat_list_labels(output: &DiffOutput) -> Vec<String> {
+    let mut labels = Vec::new();
+    for file in output.files() {
+        labels.push(format!("f:{}", crate::diff::file_header_text(file)));
+    }
+    for path in output.untracked() {
+        labels.push(format!("u:{path}"));
+    }
+    labels
 }
 
 fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<()> {
