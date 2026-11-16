@@ -10,6 +10,7 @@ mod lines_with_wrapped_row_count;
 mod mark;
 mod notify_pair;
 mod render;
+mod repo;
 mod search;
 mod size;
 mod terminal;
@@ -36,6 +37,9 @@ use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyTx;
 use crate::render::terminal_size;
+use crate::repo::diff_command;
+use crate::repo::git_diff_command;
+use crate::repo::sl_diff_command;
 use crate::search::history::store::History;
 use crate::terminal_bg::query_terminal_bg;
 use crate::terminal_guard::TerminalGuard;
@@ -47,13 +51,13 @@ struct Args {
     #[clap(short = 'n', long, env = "LIVE_DIFF_INTERVAL", default_value = "0.5")]
     interval: IntervalArg,
 
-    /// Command to run. Defaults to `sl diff -r prev`.
-    #[clap(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        default_values = ["sl", "diff", "-r", "prev"],
-    )]
-    command: Vec<String>,
+    /// Use `sl diff -r prev`.
+    #[clap(long, conflicts_with = "git")]
+    sl: bool,
+
+    /// Use `git diff HEAD^`.
+    #[clap(long, conflicts_with = "sl")]
+    git: bool,
 }
 
 fn install_panic_hook() {
@@ -67,6 +71,13 @@ fn install_panic_hook() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let command = if args.sl {
+        sl_diff_command()
+    } else if args.git {
+        git_diff_command()
+    } else {
+        diff_command()?
+    };
     let history = History::load_from_home().await;
 
     // Capture the first snapshot on the primary screen so the alternate
@@ -74,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
-        args.command,
+        command,
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
@@ -128,6 +139,35 @@ fn spawn_key_reader(
         }
     });
     (handle, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use crate::Args;
+
+    #[test]
+    fn test_sl_and_git_flags_conflict() {
+        let err = Args::try_parse_from(["live-diff", "--sl", "--git"]).unwrap_err();
+        let text = err.to_string();
+        assert_eq!(true, text.contains("--sl"));
+        assert_eq!(true, text.contains("--git"));
+    }
+
+    #[test]
+    fn test_sl_flag_parses() {
+        let args = Args::try_parse_from(["live-diff", "--sl"]).unwrap();
+        assert_eq!(true, args.sl);
+        assert_eq!(false, args.git);
+    }
+
+    #[test]
+    fn test_git_flag_parses() {
+        let args = Args::try_parse_from(["live-diff", "--git"]).unwrap();
+        assert_eq!(false, args.sl);
+        assert_eq!(true, args.git);
+    }
 }
 
 /// Sets the key-reader stop flag when the watch loop exits.
