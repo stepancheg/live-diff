@@ -10,6 +10,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
+use crate::diff::DiffOutput;
 use crate::height::Height;
 use crate::help::help_lines;
 use crate::mark::MarkOp;
@@ -31,7 +32,6 @@ use crate::search::state::Search;
 use crate::search::state::is_case_mode_status;
 use crate::search::state::status_after_output;
 use crate::size::Size;
-use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
 use crate::terminal::line::fold_case;
 use crate::terminal::width::Width;
@@ -79,8 +79,8 @@ impl EventLoop {
 
     pub(crate) async fn run(
         &mut self,
-        first_lines: Vec<Line>,
-        output_rx: Receiver<Vec<Line>>,
+        first_lines: DiffOutput,
+        output_rx: Receiver<DiffOutput>,
         keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
@@ -94,8 +94,8 @@ impl EventLoop {
 
     async fn drive(
         &mut self,
-        first_lines: Vec<Line>,
-        mut output_rx: Receiver<Vec<Line>>,
+        first_lines: DiffOutput,
+        mut output_rx: Receiver<DiffOutput>,
         mut keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
@@ -104,12 +104,12 @@ impl EventLoop {
         loop {
             tokio::select! {
                 msg = output_rx.recv() => {
-                    let Some(lines) = msg else {
+                    let Some(output) = msg else {
                         // Capture loop exited (receiver dropped or task ended).
                         capture_task.await?;
                         return Ok(());
                     };
-                    self.on_command_output(lines)?;
+                    self.on_command_output(output)?;
                 }
                 event = keys.recv() => {
                     let Some(event) = event else {
@@ -163,9 +163,9 @@ impl EventLoop {
         self.search.resume_from_history(entries);
     }
 
-    fn on_command_output(&mut self, lines: Vec<Line>) -> anyhow::Result<()> {
+    fn on_command_output(&mut self, output: DiffOutput) -> anyhow::Result<()> {
         let anchor = self.search.anchor(self.renderer.lines());
-        self.renderer.set_lines(lines);
+        self.renderer.set_diff(output);
         self.search.reattach(self.renderer.lines(), anchor);
         self.search.apply_highlight(&mut self.renderer);
         if !matches!(self.mode, Mode::Prompt(_) | Mode::Dash | Mode::Mark(_)) {

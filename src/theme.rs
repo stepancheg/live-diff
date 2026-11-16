@@ -11,6 +11,36 @@ pub(crate) const NVIM_LIGHT_GREY1: TerminalColor = TerminalColor::Rgb(0xee, 0xf1
 /// Neovim `NvimDarkGrey1`.
 pub(crate) const NVIM_DARK_GREY1: TerminalColor = TerminalColor::Rgb(0x07, 0x08, 0x0d);
 
+pub(crate) fn diff_file_header_style() -> Style {
+    let mut style = Style::plain();
+    style.bold = true;
+    style
+}
+
+pub(crate) fn diff_hunk_header_style() -> Style {
+    let mut style = Style::plain();
+    style.fg = Some(TerminalColor::Magenta);
+    style
+}
+
+pub(crate) fn diff_insert_style() -> Style {
+    let mut style = Style::plain();
+    style.fg = Some(TerminalColor::Green);
+    style
+}
+
+pub(crate) fn diff_delete_style() -> Style {
+    let mut style = Style::plain();
+    style.fg = Some(TerminalColor::Red);
+    style
+}
+
+pub(crate) fn diff_note_style() -> Style {
+    let mut style = Style::plain();
+    style.dim = true;
+    style
+}
+
 /// Neovim Search / CurSearch: two yellow shades. The current hit uses the
 /// shade that contrasts with the terminal background.
 pub(crate) fn search_highlight(base: Style, terminal_bg: TerminalBg, current: bool) -> Style {

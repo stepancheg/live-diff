@@ -11,9 +11,9 @@ use tokio::net::unix::pipe;
 use tokio::process::Child;
 use tokio::sync::mpsc::Sender;
 
+use crate::diff::DiffOutput;
+use crate::diff::parse_diff;
 use crate::notify_pair::NotifyRx;
-use crate::terminal::line::Line;
-use crate::terminal::parse::parse_command_output;
 
 /// Result of a capture that may be cut short by `interrupt`.
 pub(crate) enum CaptureOutcome {
@@ -84,20 +84,20 @@ pub(crate) async fn capture_command_output_interruptible(
 pub(crate) async fn capture_command_output_loop(
     command: Vec<String>,
     interval: Duration,
-    tx: Sender<Vec<Line>>,
+    tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
     loop {
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
-        let lines = match outcome {
+        let output = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
-            Ok(CaptureOutcome::Done(bytes)) => parse_command_output(&bytes),
+            Ok(CaptureOutcome::Done(bytes)) => parse_diff(&bytes),
             Err(err) => {
                 let text = format!("error: {err:?}");
-                parse_command_output(text.as_bytes())
+                DiffOutput::message(&text)
             }
         };
-        if tx.send(lines).await.is_err() {
+        if tx.send(output).await.is_err() {
             return;
         }
         tokio::select! {

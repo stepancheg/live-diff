@@ -48,7 +48,6 @@ impl TerminalString {
         Some(TerminalString { content: s, width })
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn sanitize(s: impl Display) -> TerminalString {
         let mut content = String::new();
         for c in s.to_string().chars() {

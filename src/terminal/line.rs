@@ -1,4 +1,6 @@
 use crate::terminal::span::Span;
+use crate::terminal::style::Style;
+use crate::terminal::terminal_str::string::TerminalString;
 use crate::terminal::width::Width;
 
 /// One row of styled spans. Not yet wrapped to the terminal width.
@@ -10,6 +12,20 @@ pub(crate) struct Line {
 impl Line {
     pub(crate) fn new() -> Line {
         Line { spans: Vec::new() }
+    }
+
+    /// One span of `text` in `style`. Controls are replaced with spaces.
+    /// An empty `text` is a blank line with no spans.
+    pub(crate) fn from_styled(text: &str, style: Style) -> Line {
+        if text.is_empty() {
+            return Line::new();
+        }
+        Line {
+            spans: vec![Span {
+                style,
+                content: TerminalString::sanitize(text),
+            }],
+        }
     }
 
     pub(crate) fn width(&self) -> Width {

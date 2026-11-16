@@ -1,58 +1,576 @@
-use crate::terminal::line::Line;
+use unicode_width::UnicodeWidthChar;
 
-/// File header inside a unified or git diff: the `diff ...` line through
-/// the metadata lines that precede the first hunk.
+use crate::terminal::line::Line;
+use crate::terminal::parse::parse_command_output;
+use crate::terminal::style::Style;
+use crate::theme::diff_delete_style;
+use crate::theme::diff_file_header_style;
+use crate::theme::diff_hunk_header_style;
+use crate::theme::diff_insert_style;
+use crate::theme::diff_note_style;
+
+/// One file in a diff. `old` / `new` are `None` when that side is
+/// `/dev/null` (a new or deleted file).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileDiff {
+    pub(crate) old: Option<String>,
+    pub(crate) new: Option<String>,
+    pub(crate) binary: bool,
+    pub(crate) hunks: Vec<Hunk>,
+}
+
+/// A single `@@` hunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Hunk {
+    pub(crate) old_start: u32,
+    pub(crate) old_len: u32,
+    pub(crate) new_start: u32,
+    pub(crate) new_len: u32,
+    /// Text after the closing `@@`, usually a function name. Empty if absent.
+    pub(crate) section: String,
+    pub(crate) lines: Vec<HunkLine>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HunkLine {
+    pub(crate) kind: HunkLineKind,
+    /// Line text without the diff prefix (` `, `-`, `+`). For
+    /// [`HunkLineKind::Note`] this is the full plain line.
+    pub(crate) text: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileHeader {
-    /// Index of the first header line.
+pub(crate) enum HunkLineKind {
+    Context,
+    Delete,
+    Insert,
+    /// Not a context/delete/insert line (`\ No newline at end of file`,
+    /// or a combined-diff body line).
+    Note,
+}
+
+/// Command output as structured file diffs plus any non-diff lines,
+/// in the order they appeared.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiffOutput {
+    segments: Vec<Segment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Segment {
+    /// A non-diff line, still carrying any original ANSI so it can be
+    /// drawn as the command printed it.
+    Text(String),
+    File(FileDiff),
+}
+
+/// Line range of a file header in the projected view. `start..end` are
+/// indices into the view's lines. Derived from [`FileDiff`], not from
+/// scanning styled rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileHeaderSpan {
     pub(crate) start: usize,
-    /// Index one past the last header line. Hunks and other body lines
-    /// start here.
     pub(crate) end: usize,
 }
 
-/// Locate each file header in diff output.
-///
-/// Understands git extended headers (`diff --git`, `diff --cc`,
-/// `diff --combined`), Sapling/Mercurial headers (`diff -r`), and a
-/// classic unified pair (`---` / `+++`) with no preceding `diff` line.
-/// Lines before the first header, and lines that are not part of a
-/// header, are left alone. The section for a file runs from its
-/// header through the line before the next header.
-pub(crate) fn file_headers(lines: &[Line]) -> Vec<FileHeader> {
-    let mut headers = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let text = lines[i].plain_text();
-        if is_diff_command_start(&text) || is_unified_pair_start(lines, i) {
-            let start = i;
-            i += 1;
-            while i < lines.len() {
-                let next = lines[i].plain_text();
-                if is_diff_command_start(&next) || !is_header_meta(&next) {
-                    break;
-                }
-                i += 1;
-            }
-            headers.push(FileHeader { start, end: i });
-            continue;
-        }
-        i += 1;
-    }
-    headers
+/// Display lines built from a [`DiffOutput`], plus the header span of
+/// each file in those lines.
+pub(crate) struct DiffView {
+    pub(crate) lines: Vec<Line>,
+    pub(crate) headers: Vec<FileHeaderSpan>,
 }
 
-/// Index of the file header whose section contains `line`.
+impl DiffOutput {
+    /// A message that is not a diff (capture error, etc.).
+    pub(crate) fn message(text: &str) -> DiffOutput {
+        let mut segments = Vec::new();
+        for line in split_raw_lines(text.as_bytes()) {
+            segments.push(Segment::Text(line.raw));
+        }
+        DiffOutput { segments }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn files(&self) -> Vec<&FileDiff> {
+        let mut files = Vec::new();
+        for segment in &self.segments {
+            if let Segment::File(file) = segment {
+                files.push(file);
+            }
+        }
+        files
+    }
+
+    /// Project this snapshot to styled lines. Diff content is drawn from
+    /// the [`FileDiff`] fields; non-diff text is drawn from its original
+    /// bytes.
+    pub(crate) fn view(&self) -> DiffView {
+        let mut lines = Vec::new();
+        let mut headers = Vec::new();
+        let mut i = 0;
+        while i < self.segments.len() {
+            match &self.segments[i] {
+                Segment::Text(_) => {
+                    // Parse a run of non-diff lines as one stream so SGR
+                    // state carries across lines, as the command emitted it.
+                    let mut raw = String::new();
+                    while i < self.segments.len() {
+                        match &self.segments[i] {
+                            Segment::Text(line) => {
+                                raw.push_str(line);
+                                raw.push('\n');
+                                i += 1;
+                            }
+                            Segment::File(_) => break,
+                        }
+                    }
+                    lines.extend(parse_command_output(raw.as_bytes()));
+                }
+                Segment::File(file) => {
+                    let start = lines.len();
+                    lines.push(Line::from_styled(
+                        &file_header_text(file),
+                        diff_file_header_style(),
+                    ));
+                    let end = lines.len();
+                    headers.push(FileHeaderSpan { start, end });
+                    push_file_body(file, &mut lines);
+                    i += 1;
+                }
+            }
+        }
+        DiffView { lines, headers }
+    }
+}
+
+/// Parse raw command output into file diffs.
+///
+/// ANSI escapes are stripped before any structural match. The terminal
+/// line parser is not used here.
+pub(crate) fn parse_diff(input: &[u8]) -> DiffOutput {
+    let raw_lines = split_raw_lines(input);
+    let mut segments = Vec::new();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        if let Some((file, next)) = parse_file(&raw_lines, i) {
+            segments.push(Segment::File(file));
+            i = next;
+            continue;
+        }
+        segments.push(Segment::Text(raw_lines[i].raw.clone()));
+        i += 1;
+    }
+    DiffOutput { segments }
+}
+
+/// Index of the header span whose file section contains `line`.
 ///
 /// A section runs from `headers[i].start` to `headers[i + 1].start`
-/// (or the end of `lines`). Returns `None` when `line` is before the
+/// (or the end of the view). Returns `None` when `line` is before the
 /// first header.
-pub(crate) fn file_header_index(headers: &[FileHeader], line: usize) -> Option<usize> {
+pub(crate) fn file_header_index(headers: &[FileHeaderSpan], line: usize) -> Option<usize> {
     let i = headers.partition_point(|header| header.start <= line);
     if i == 0 {
         return None;
     }
     Some(i - 1)
+}
+
+struct RawLine {
+    /// Original line without the trailing newline, ANSI intact.
+    raw: String,
+    /// `raw` with CSI/OSC/other escapes removed. Used for structure.
+    plain: String,
+}
+
+fn split_raw_lines(input: &[u8]) -> Vec<RawLine> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(input);
+    let mut lines = Vec::new();
+    for part in text.split('\n') {
+        let part = part.strip_suffix('\r').unwrap_or(part);
+        lines.push(RawLine {
+            raw: part.to_owned(),
+            plain: strip_ansi(part),
+        });
+    }
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+/// Drop CSI, OSC, and other ESC sequences. The remaining text is what
+/// the diff grammar is matched against.
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            // Copy one UTF-8 character.
+            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            out.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+            }
+            b']' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                // Two-byte ESC sequence: skip the final byte.
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn parse_file(lines: &[RawLine], start: usize) -> Option<(FileDiff, usize)> {
+    let plain = &lines[start].plain;
+    let from_diff_cmd = is_diff_command_start(plain);
+    let from_pair = is_unified_pair_start(lines, start);
+    if !from_diff_cmd && !from_pair {
+        return None;
+    }
+
+    let mut i = start;
+    let mut old_path: Option<String> = None;
+    let mut new_path: Option<String> = None;
+    let mut old_is_null = false;
+    let mut new_is_null = false;
+    let mut rename_from: Option<String> = None;
+    let mut rename_to: Option<String> = None;
+    let mut git_old: Option<String> = None;
+    let mut git_new: Option<String> = None;
+    let mut rev_path: Option<String> = None;
+
+    if from_diff_cmd {
+        if plain.starts_with("diff --git ") {
+            let (a, b) = parse_diff_git_paths(plain);
+            git_old = a;
+            git_new = b;
+        } else if plain.starts_with("diff -r ") {
+            rev_path = parse_diff_r_path(plain);
+        } else if plain.starts_with("diff --cc ") || plain.starts_with("diff --combined ") {
+            // Combined diffs: one path.
+            let path = plain
+                .strip_prefix("diff --cc ")
+                .or_else(|| plain.strip_prefix("diff --combined "))
+                .map(parse_path_field);
+            git_old = path.clone();
+            git_new = path;
+        }
+        i += 1;
+    }
+
+    // Metadata lines, including a leading ---/+++ pair.
+    while i < lines.len() {
+        let text = &lines[i].plain;
+        if is_diff_command_start(text) {
+            break;
+        }
+        if is_hunk_header(text) || is_binary_notice(text) || text.starts_with("GIT binary patch") {
+            break;
+        }
+        if !is_header_meta(text) {
+            // Blank lines between the header and the first hunk are
+            // skipped. Anything else ends the header; leave it for the
+            // body/outer parser.
+            if text.is_empty() {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if is_minus_file_line(text) {
+            match path_from_marker(text) {
+                None => old_is_null = true,
+                Some(path) => {
+                    old_path = Some(path);
+                    old_is_null = false;
+                }
+            }
+        } else if is_plus_file_line(text) {
+            match path_from_marker(text) {
+                None => new_is_null = true,
+                Some(path) => {
+                    new_path = Some(path);
+                    new_is_null = false;
+                }
+            }
+        } else if let Some(path) = text.strip_prefix("rename from ") {
+            rename_from = Some(parse_path_field(path));
+        } else if let Some(path) = text.strip_prefix("rename to ") {
+            rename_to = Some(parse_path_field(path));
+        } else if let Some(path) = text.strip_prefix("copy from ") {
+            rename_from = Some(parse_path_field(path));
+        } else if let Some(path) = text.strip_prefix("copy to ") {
+            rename_to = Some(parse_path_field(path));
+        }
+        i += 1;
+    }
+
+    let mut binary = false;
+    let mut hunks = Vec::new();
+    let combined = lines[start].plain.starts_with("diff --cc ")
+        || lines[start].plain.starts_with("diff --combined ");
+
+    // Skip blanks before the body.
+    while i < lines.len() && lines[i].plain.is_empty() {
+        i += 1;
+    }
+
+    if i < lines.len() && is_binary_notice(&lines[i].plain) {
+        binary = true;
+        i += 1;
+    } else if i < lines.len() && lines[i].plain.starts_with("GIT binary patch") {
+        binary = true;
+        i += 1;
+        while i < lines.len() && !is_file_start(lines, i) {
+            i += 1;
+        }
+    } else if combined {
+        // Keep combined-diff body lines as notes inside one hunk so the
+        // text is not dropped, and stop at the next file.
+        let mut body = Vec::new();
+        while i < lines.len() && !is_file_start(lines, i) {
+            if is_hunk_header(&lines[i].plain) || lines[i].plain.starts_with("@@@") {
+                // Fall through: store the line as a note.
+            }
+            body.push(HunkLine {
+                kind: HunkLineKind::Note,
+                text: lines[i].plain.clone(),
+            });
+            i += 1;
+        }
+        if !body.is_empty() {
+            hunks.push(Hunk {
+                old_start: 0,
+                old_len: 0,
+                new_start: 0,
+                new_len: 0,
+                section: String::new(),
+                lines: body,
+            });
+        }
+    } else {
+        while i < lines.len() && is_hunk_header(&lines[i].plain) {
+            let Some(hunk_header) = parse_hunk_header(&lines[i].plain) else {
+                break;
+            };
+            i += 1;
+            let (hunk_lines, next) =
+                parse_hunk_lines(lines, i, hunk_header.old_len, hunk_header.new_len);
+            i = next;
+            hunks.push(Hunk {
+                old_start: hunk_header.old_start,
+                old_len: hunk_header.old_len,
+                new_start: hunk_header.new_start,
+                new_len: hunk_header.new_len,
+                section: hunk_header.section,
+                lines: hunk_lines,
+            });
+            while i < lines.len() && lines[i].plain.is_empty() {
+                // A blank line is not part of the hunk (counts are done).
+                // Leave it if the next non-blank is not another hunk, so
+                // it stays visible; if another hunk follows, skip it.
+                if i + 1 < lines.len() && is_hunk_header(&lines[i + 1].plain) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let old = if old_is_null {
+        None
+    } else {
+        rename_from
+            .or(old_path)
+            .or(git_old)
+            .or_else(|| rev_path.clone())
+    };
+    let new = if new_is_null {
+        None
+    } else {
+        rename_to.or(new_path).or(git_new).or(rev_path)
+    };
+
+    // A diff command with no paths and no body is still a file, but a
+    // bare ---/+++ pair that we entered must have been a real pair.
+    Some((
+        FileDiff {
+            old,
+            new,
+            binary,
+            hunks,
+        },
+        i,
+    ))
+}
+
+struct HunkHeader {
+    old_start: u32,
+    old_len: u32,
+    new_start: u32,
+    new_len: u32,
+    section: String,
+}
+
+fn parse_hunk_lines(
+    lines: &[RawLine],
+    start: usize,
+    old_len: u32,
+    new_len: u32,
+) -> (Vec<HunkLine>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    let mut old_left = old_len;
+    let mut new_left = new_len;
+    while (old_left > 0 || new_left > 0) && i < lines.len() {
+        let text = &lines[i].plain;
+        if let Some(rest) = strip_hunk_prefix(text, ' ') {
+            if old_left == 0 || new_left == 0 {
+                break;
+            }
+            out.push(HunkLine {
+                kind: HunkLineKind::Context,
+                text: rest,
+            });
+            old_left -= 1;
+            new_left -= 1;
+            i += 1;
+        } else if let Some(rest) = strip_hunk_prefix(text, '-') {
+            if old_left == 0 {
+                break;
+            }
+            out.push(HunkLine {
+                kind: HunkLineKind::Delete,
+                text: rest,
+            });
+            old_left -= 1;
+            i += 1;
+        } else if let Some(rest) = strip_hunk_prefix(text, '+') {
+            if new_left == 0 {
+                break;
+            }
+            out.push(HunkLine {
+                kind: HunkLineKind::Insert,
+                text: rest,
+            });
+            new_left -= 1;
+            i += 1;
+        } else if text.starts_with('\\') {
+            out.push(HunkLine {
+                kind: HunkLineKind::Note,
+                text: text.clone(),
+            });
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    // Counts do not include the marker, so it can sit after the last
+    // counted line, once old_left and new_left are already 0.
+    while i < lines.len() && lines[i].plain.starts_with('\\') {
+        out.push(HunkLine {
+            kind: HunkLineKind::Note,
+            text: lines[i].plain.clone(),
+        });
+        i += 1;
+    }
+    (out, i)
+}
+
+/// Strip a one-character diff prefix. The prefix must be present; the
+/// rest of the line (possibly empty) is the file text.
+fn strip_hunk_prefix(text: &str, prefix: char) -> Option<String> {
+    let mut chars = text.chars();
+    if chars.next() == Some(prefix) {
+        Some(chars.as_str().to_owned())
+    } else {
+        None
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let mut s = line.strip_prefix("@@ ")?;
+    s = s.strip_prefix('-')?;
+    let (old_start, rest) = parse_u32_prefix(s)?;
+    s = rest;
+    let (old_len, rest) = match s.strip_prefix(',') {
+        Some(rest) => parse_u32_prefix(rest)?,
+        None => (1, s),
+    };
+    s = rest;
+    s = s.strip_prefix(' ')?;
+    s = s.strip_prefix('+')?;
+    let (new_start, rest) = parse_u32_prefix(s)?;
+    s = rest;
+    let (new_len, rest) = match s.strip_prefix(',') {
+        Some(rest) => parse_u32_prefix(rest)?,
+        None => (1, s),
+    };
+    s = rest;
+    s = s.strip_prefix(" @@")?;
+    let section = match s.strip_prefix(' ') {
+        Some(rest) => rest.trim_end().to_owned(),
+        None => s.trim_end().to_owned(),
+    };
+    Some(HunkHeader {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+        section,
+    })
+}
+
+fn parse_u32_prefix(s: &str) -> Option<(u32, &str)> {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let n = s[..end].parse::<u32>().ok()?;
+    Some((n, &s[end..]))
+}
+
+fn is_file_start(lines: &[RawLine], index: usize) -> bool {
+    is_diff_command_start(&lines[index].plain) || is_unified_pair_start(lines, index)
 }
 
 fn is_diff_command_start(text: &str) -> bool {
@@ -62,11 +580,19 @@ fn is_diff_command_start(text: &str) -> bool {
         || text.starts_with("diff -r ")
 }
 
-fn is_unified_pair_start(lines: &[Line], index: usize) -> bool {
+fn is_unified_pair_start(lines: &[RawLine], index: usize) -> bool {
     let Some(next) = lines.get(index + 1) else {
         return false;
     };
-    is_minus_file_line(&lines[index].plain_text()) && is_plus_file_line(&next.plain_text())
+    is_minus_file_line(&lines[index].plain) && is_plus_file_line(&next.plain)
+}
+
+fn is_hunk_header(text: &str) -> bool {
+    text.starts_with("@@ ") || text.starts_with("@@\t")
+}
+
+fn is_binary_notice(text: &str) -> bool {
+    text.starts_with("Binary files ") || text.starts_with("Binary file ")
 }
 
 fn is_header_meta(text: &str) -> bool {
@@ -86,6 +612,8 @@ fn is_header_meta(text: &str) -> bool {
 }
 
 fn is_minus_file_line(text: &str) -> bool {
+    // `--- ` / `---\t` are file markers. A marker with no space (`---`)
+    // is not used by git or sl.
     text.starts_with("--- ") || text.starts_with("---\t")
 }
 
@@ -93,19 +621,256 @@ fn is_plus_file_line(text: &str) -> bool {
     text.starts_with("+++ ") || text.starts_with("+++\t")
 }
 
+/// Path from a `---` / `+++` line. `None` means `/dev/null`.
+fn path_from_marker(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("--- ")
+        .or_else(|| line.strip_prefix("---\t"))
+        .or_else(|| line.strip_prefix("+++ "))
+        .or_else(|| line.strip_prefix("+++\t"))?;
+    let path = parse_path_field(rest);
+    if path == "/dev/null" {
+        None
+    } else {
+        Some(strip_ab_prefix(&path).to_owned())
+    }
+}
+
+fn parse_path_field(s: &str) -> String {
+    let s = s.trim_end();
+    let s = match s.split_once('\t') {
+        Some((path, _)) => path,
+        None => s,
+    };
+    let s = s.trim();
+    if s.starts_with('"') {
+        let (path, _) = take_quoted(s);
+        return path;
+    }
+    s.to_owned()
+}
+
+fn take_quoted(s: &str) -> (String, &str) {
+    let Some(rest) = s.strip_prefix('"') else {
+        return (s.to_owned(), "");
+    };
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((idx, c)) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some((_, escaped)) => out.push(match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    other => other,
+                }),
+                None => {
+                    out.push('\\');
+                    return (out, "");
+                }
+            }
+            continue;
+        }
+        if c == '"' {
+            let next = idx + 1;
+            return (out, &rest[next..]);
+        }
+        out.push(c);
+    }
+    (out, "")
+}
+
+fn parse_diff_git_paths(line: &str) -> (Option<String>, Option<String>) {
+    let Some(rest) = line.strip_prefix("diff --git ") else {
+        return (None, None);
+    };
+    let (old, new) = parse_two_paths(rest);
+    (normalize_side(&old), normalize_side(&new))
+}
+
+fn parse_two_paths(s: &str) -> (String, String) {
+    let s = s.trim();
+    if s.starts_with('"') {
+        let (first, rest) = take_quoted(s);
+        let rest = rest.trim_start();
+        let second = if rest.starts_with('"') {
+            take_quoted(rest).0
+        } else {
+            rest.to_owned()
+        };
+        return (first, second);
+    }
+    if s.starts_with("a/") {
+        if let Some(pos) = s.find(" b/") {
+            return (s[..pos].to_owned(), s[pos + 1..].to_owned());
+        }
+    }
+    match s.rsplit_once(' ') {
+        Some((old, new)) => (old.to_owned(), new.to_owned()),
+        None => (s.to_owned(), s.to_owned()),
+    }
+}
+
+fn parse_diff_r_path(line: &str) -> Option<String> {
+    let mut rest = line.strip_prefix("diff -r ")?;
+    // First revision token.
+    let space = rest.find(' ')?;
+    rest = &rest[space + 1..];
+    if let Some(after) = rest.strip_prefix("-r ") {
+        let space = after.find(' ')?;
+        rest = &after[space + 1..];
+    }
+    let path = parse_path_field(rest);
+    if path.is_empty() {
+        None
+    } else {
+        Some(strip_ab_prefix(&path).to_owned())
+    }
+}
+
+fn normalize_side(path: &str) -> Option<String> {
+    let path = parse_path_field(path);
+    if path == "/dev/null" {
+        None
+    } else {
+        Some(strip_ab_prefix(&path).to_owned())
+    }
+}
+
+fn strip_ab_prefix(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix("a/") {
+        rest
+    } else if let Some(rest) = path.strip_prefix("b/") {
+        rest
+    } else {
+        path
+    }
+}
+
+fn file_header_text(file: &FileDiff) -> String {
+    match (&file.old, &file.new) {
+        (Some(old), Some(new)) if old == new => old.clone(),
+        (Some(old), Some(new)) => format!("{old} -> {new}"),
+        (None, Some(new)) => format!("{new} (new)"),
+        (Some(old), None) => format!("{old} (deleted)"),
+        (None, None) => String::from("(unknown)"),
+    }
+}
+
+fn push_file_body(file: &FileDiff, lines: &mut Vec<Line>) {
+    if file.binary {
+        lines.push(Line::from_styled("Binary files differ", diff_note_style()));
+    }
+    for hunk in &file.hunks {
+        if hunk.old_len == 0
+            && hunk.new_len == 0
+            && hunk.section.is_empty()
+            && hunk_is_notes_only(hunk)
+        {
+            for line in &hunk.lines {
+                lines.push(Line::from_styled(
+                    &expand_tabs(&line.text),
+                    diff_note_style(),
+                ));
+            }
+            continue;
+        }
+        lines.push(Line::from_styled(
+            &expand_tabs(&hunk_header_text(hunk)),
+            diff_hunk_header_style(),
+        ));
+        for line in &hunk.lines {
+            let (text, style) = match line.kind {
+                HunkLineKind::Context => (
+                    expand_tabs(&format!(" {text}", text = line.text)),
+                    Style::plain(),
+                ),
+                HunkLineKind::Delete => (
+                    expand_tabs(&format!("-{text}", text = line.text)),
+                    diff_delete_style(),
+                ),
+                HunkLineKind::Insert => (
+                    expand_tabs(&format!("+{text}", text = line.text)),
+                    diff_insert_style(),
+                ),
+                HunkLineKind::Note => (expand_tabs(&line.text), diff_note_style()),
+            };
+            lines.push(Line::from_styled(&text, style));
+        }
+    }
+}
+
+fn hunk_is_notes_only(hunk: &Hunk) -> bool {
+    !hunk.lines.is_empty()
+        && hunk
+            .lines
+            .iter()
+            .all(|line| line.kind == HunkLineKind::Note)
+}
+
+fn hunk_header_text(hunk: &Hunk) -> String {
+    let mut s = String::from("@@ -");
+    s.push_str(&hunk.old_start.to_string());
+    if hunk.old_len != 1 {
+        s.push(',');
+        s.push_str(&hunk.old_len.to_string());
+    }
+    s.push_str(" +");
+    s.push_str(&hunk.new_start.to_string());
+    if hunk.new_len != 1 {
+        s.push(',');
+        s.push_str(&hunk.new_len.to_string());
+    }
+    s.push_str(" @@");
+    if !hunk.section.is_empty() {
+        s.push(' ');
+        s.push_str(&hunk.section);
+    }
+    s
+}
+
+fn expand_tabs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0u32;
+    for c in s.chars() {
+        if c == '\t' {
+            let spaces = 8 - (col % 8);
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            col = col.saturating_add(spaces);
+            continue;
+        }
+        out.push(c);
+        let w = u32::try_from(c.width_cjk().unwrap_or(0)).unwrap_or(0);
+        col = col.saturating_add(w);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::diff::FileHeader;
+    use crate::diff::FileDiff;
+    use crate::diff::Hunk;
+    use crate::diff::HunkLine;
+    use crate::diff::HunkLineKind;
     use crate::diff::file_header_index;
-    use crate::diff::file_headers;
-    use crate::terminal::parse::parse_command_output;
+    use crate::diff::parse_diff;
 
-    fn headers_of(input: &[u8]) -> Vec<FileHeader> {
-        file_headers(&parse_command_output(input))
+    fn files_of(input: &[u8]) -> Vec<FileDiff> {
+        parse_diff(input).files().into_iter().cloned().collect()
+    }
+
+    fn line(kind: HunkLineKind, text: &str) -> HunkLine {
+        HunkLine {
+            kind,
+            text: text.to_owned(),
+        }
     }
 
     #[test]
-    fn test_git_extended_headers() {
+    fn test_git_extended_two_files() {
         let input = b"\
 diff --git a/foo.rs b/foo.rs
 index 1111111..2222222 100644
@@ -123,16 +888,51 @@ new file mode 100644
 ";
         assert_eq!(
             vec![
-                FileHeader { start: 0, end: 4 },
-                FileHeader { start: 7, end: 11 },
+                FileDiff {
+                    old: Some(String::from("foo.rs")),
+                    new: Some(String::from("foo.rs")),
+                    binary: false,
+                    hunks: vec![Hunk {
+                        old_start: 1,
+                        old_len: 2,
+                        new_start: 1,
+                        new_len: 2,
+                        section: String::new(),
+                        lines: vec![
+                            line(HunkLineKind::Delete, "old"),
+                            line(HunkLineKind::Insert, "new"),
+                        ],
+                    }],
+                },
+                FileDiff {
+                    old: None,
+                    new: Some(String::from("bar.rs")),
+                    binary: false,
+                    hunks: vec![Hunk {
+                        old_start: 0,
+                        old_len: 0,
+                        new_start: 1,
+                        new_len: 1,
+                        section: String::new(),
+                        lines: vec![line(HunkLineKind::Insert, "hello")],
+                    }],
+                },
             ],
-            headers_of(input)
+            files_of(input)
         );
     }
 
     #[test]
-    fn test_colored_git_header() {
-        let input = b"\
+    fn test_colored_git_header_matches_plain() {
+        let plain = b"\
+diff --git a/foo b/foo
+new file mode 100644
+--- /dev/null
++++ b/foo
+@@ -0,0 +1 @@
++x
+";
+        let colored = b"\
 \x1b[1mdiff --git a/foo b/foo\x1b[0m
 \x1b[1m\x1b[36mnew file mode 100644\x1b[0m
 \x1b[1m\x1b[31m--- /dev/null\x1b[0m
@@ -140,7 +940,23 @@ new file mode 100644
 \x1b[35m@@ -0,0 +1 @@\x1b[39m
 \x1b[32m+x\x1b[39m
 ";
-        assert_eq!(vec![FileHeader { start: 0, end: 4 }], headers_of(input));
+        assert_eq!(files_of(plain), files_of(colored));
+        assert_eq!(
+            vec![FileDiff {
+                old: None,
+                new: Some(String::from("foo")),
+                binary: false,
+                hunks: vec![Hunk {
+                    old_start: 0,
+                    old_len: 0,
+                    new_start: 1,
+                    new_len: 1,
+                    section: String::new(),
+                    lines: vec![line(HunkLineKind::Insert, "x")],
+                }],
+            }],
+            files_of(colored)
+        );
     }
 
     #[test]
@@ -153,11 +969,29 @@ diff -r 84ed658d4664 foo.rs
 -old
 +new
 ";
-        assert_eq!(vec![FileHeader { start: 0, end: 3 }], headers_of(input));
+        assert_eq!(
+            vec![FileDiff {
+                old: Some(String::from("foo.rs")),
+                new: Some(String::from("foo.rs")),
+                binary: false,
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_len: 1,
+                    new_start: 1,
+                    new_len: 1,
+                    section: String::new(),
+                    lines: vec![
+                        line(HunkLineKind::Delete, "old"),
+                        line(HunkLineKind::Insert, "new"),
+                    ],
+                }],
+            }],
+            files_of(input)
+        );
     }
 
     #[test]
-    fn test_rename_header_includes_extended_meta() {
+    fn test_rename_paths() {
         let input = b"\
 diff --git a/old b/new
 similarity index 95%
@@ -170,11 +1004,15 @@ index abcdef0..1234567 100644
 -a
 +b
 ";
-        assert_eq!(vec![FileHeader { start: 0, end: 7 }], headers_of(input));
+        let files = files_of(input);
+        assert_eq!(1, files.len());
+        assert_eq!(Some(String::from("old")), files[0].old);
+        assert_eq!(Some(String::from("new")), files[0].new);
+        assert_eq!(1, files[0].hunks.len());
     }
 
     #[test]
-    fn test_binary_notice_ends_header() {
+    fn test_binary_file() {
         let input = b"\
 diff --git a/foo.bin b/foo.bin
 index 1111111..2222222 100644
@@ -186,13 +1024,13 @@ diff --git a/bar b/bar
 -a
 +b
 ";
-        assert_eq!(
-            vec![
-                FileHeader { start: 0, end: 2 },
-                FileHeader { start: 3, end: 6 },
-            ],
-            headers_of(input)
-        );
+        let files = files_of(input);
+        assert_eq!(2, files.len());
+        assert_eq!(true, files[0].binary);
+        assert_eq!(true, files[0].hunks.is_empty());
+        assert_eq!(Some(String::from("foo.bin")), files[0].old);
+        assert_eq!(false, files[1].binary);
+        assert_eq!(Some(String::from("bar")), files[1].new);
     }
 
     #[test]
@@ -204,11 +1042,49 @@ diff --git a/bar b/bar
 -a
 +b
 ";
-        assert_eq!(vec![FileHeader { start: 0, end: 2 }], headers_of(input));
+        assert_eq!(
+            vec![FileDiff {
+                old: Some(String::from("foo")),
+                new: Some(String::from("foo")),
+                binary: false,
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_len: 1,
+                    new_start: 1,
+                    new_len: 1,
+                    section: String::new(),
+                    lines: vec![
+                        line(HunkLineKind::Delete, "a"),
+                        line(HunkLineKind::Insert, "b"),
+                    ],
+                }],
+            }],
+            files_of(input)
+        );
     }
 
     #[test]
-    fn test_preamble_is_not_a_header() {
+    fn test_deleted_file() {
+        let input = b"\
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let files = files_of(input);
+        assert_eq!(1, files.len());
+        assert_eq!(Some(String::from("gone.rs")), files[0].old);
+        assert_eq!(None, files[0].new);
+        assert_eq!(
+            vec![line(HunkLineKind::Delete, "bye")],
+            files[0].hunks[0].lines
+        );
+    }
+
+    #[test]
+    fn test_preamble_and_exit_status_are_not_files() {
         let input = b"\
 exit status: 1
 diff --git a/foo b/foo
@@ -217,40 +1093,186 @@ diff --git a/foo b/foo
 @@ -1 +1 @@
 -a
 +b
+exit status: 3
 ";
-        let headers = headers_of(input);
-        assert_eq!(vec![FileHeader { start: 1, end: 4 }], headers);
-        assert_eq!(None, file_header_index(&headers, 0));
-        assert_eq!(Some(0), file_header_index(&headers, 1));
-        assert_eq!(Some(0), file_header_index(&headers, 6));
+        let output = parse_diff(input);
+        assert_eq!(1, output.files().len());
+        assert_eq!(Some(String::from("foo")), output.files()[0].new);
+        let view = output.view();
+        let text: Vec<String> = view.lines.iter().map(|l| l.plain_text()).collect();
+        assert_eq!("exit status: 1", text[0]);
+        assert_eq!("foo", text[1]);
+        assert_eq!(true, text.iter().any(|l| l == "exit status: 3"));
+        assert_eq!(None, file_header_index(&view.headers, 0));
+        assert_eq!(Some(0), file_header_index(&view.headers, 1));
     }
 
     #[test]
-    fn test_non_diff_has_no_headers() {
-        assert_eq!(Vec::<FileHeader>::new(), headers_of(b"hello\nworld\n"));
+    fn test_non_diff_has_no_files() {
+        let output = parse_diff(b"hello\nworld\n");
+        assert_eq!(true, output.files().is_empty());
+        let view = output.view();
+        assert_eq!(2, view.lines.len());
+        assert_eq!("hello", view.lines[0].plain_text());
+        assert_eq!("world", view.lines[1].plain_text());
+        assert_eq!(true, view.headers.is_empty());
     }
 
     #[test]
     fn test_hunk_body_does_not_start_a_file() {
-        // A body line that mentions a diff header is prefixed, so it
-        // must not open a new file.
         let input = b"\
 diff --git a/foo b/foo
 --- a/foo
 +++ b/foo
-@@ -1,2 +1,2 @@
+@@ -1,3 +1,3 @@
 -diff --git a/x b/x
 +diff --git a/y b/y
  context diff --git a/z b/z
 ";
-        assert_eq!(vec![FileHeader { start: 0, end: 3 }], headers_of(input));
+        let files = files_of(input);
+        assert_eq!(1, files.len());
+        assert_eq!(
+            vec![
+                line(HunkLineKind::Delete, "diff --git a/x b/x"),
+                line(HunkLineKind::Insert, "diff --git a/y b/y"),
+                line(HunkLineKind::Context, "context diff --git a/z b/z"),
+            ],
+            files[0].hunks[0].lines
+        );
+    }
+
+    #[test]
+    fn test_hunk_counts_keep_minus_marker_lookalike() {
+        // A removed line whose text is `-- a/bar` is written as `--- a/bar`.
+        // The hunk count must keep it inside the hunk, not start a new file.
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -2,2 +1 @@
+--- a/bar
+-x
++y
+--- a/next
++++ b/next
+@@ -1 +1 @@
+-p
++q
+";
+        let files = files_of(input);
+        assert_eq!(2, files.len());
+        assert_eq!(
+            vec![
+                line(HunkLineKind::Delete, "-- a/bar"),
+                line(HunkLineKind::Delete, "x"),
+                line(HunkLineKind::Insert, "y"),
+            ],
+            files[0].hunks[0].lines
+        );
+        assert_eq!(Some(String::from("next")), files[1].new);
+    }
+
+    #[test]
+    fn test_context_and_section() {
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -10,4 +10,4 @@ fn foo()
+ keep
+-old
++new
+ keep2
+";
+        let files = files_of(input);
+        assert_eq!("fn foo()", files[0].hunks[0].section);
+        assert_eq!(10, files[0].hunks[0].old_start);
+        assert_eq!(
+            vec![
+                line(HunkLineKind::Context, "keep"),
+                line(HunkLineKind::Delete, "old"),
+                line(HunkLineKind::Insert, "new"),
+                line(HunkLineKind::Context, "keep2"),
+            ],
+            files[0].hunks[0].lines
+        );
+    }
+
+    #[test]
+    fn test_no_newline_marker() {
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+";
+        let files = files_of(input);
+        assert_eq!(
+            vec![
+                line(HunkLineKind::Delete, "old"),
+                line(HunkLineKind::Note, "\\ No newline at end of file"),
+                line(HunkLineKind::Insert, "new"),
+                line(HunkLineKind::Note, "\\ No newline at end of file"),
+            ],
+            files[0].hunks[0].lines
+        );
+    }
+
+    #[test]
+    fn test_view_header_is_path_and_hunk_is_prefixed() {
+        let input = b"\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,2 +1,2 @@
+-old
++new
+";
+        let view = parse_diff(input).view();
+        let text: Vec<String> = view.lines.iter().map(|l| l.plain_text()).collect();
+        assert_eq!(
+            vec![
+                String::from("src/foo.rs"),
+                String::from("@@ -1,2 +1,2 @@"),
+                String::from("-old"),
+                String::from("+new"),
+            ],
+            text
+        );
+        assert_eq!(
+            vec![crate::diff::FileHeaderSpan { start: 0, end: 1 }],
+            view.headers
+        );
+    }
+
+    #[test]
+    fn test_view_new_and_rename_headers() {
+        let input = b"\
+diff --git a/foo b/foo
+new file mode 100644
+--- /dev/null
++++ b/foo
+@@ -0,0 +1 @@
++x
+diff --git a/old b/new
+similarity index 100%
+rename from old
+rename to new
+";
+        let view = parse_diff(input).view();
+        assert_eq!("foo (new)", view.lines[0].plain_text());
+        assert_eq!("old -> new", view.lines[3].plain_text());
     }
 
     #[test]
     fn test_header_index_selects_section() {
         let headers = vec![
-            FileHeader { start: 2, end: 5 },
-            FileHeader { start: 10, end: 13 },
+            crate::diff::FileHeaderSpan { start: 2, end: 3 },
+            crate::diff::FileHeaderSpan { start: 10, end: 11 },
         ];
         assert_eq!(None, file_header_index(&headers, 0));
         assert_eq!(None, file_header_index(&headers, 1));
@@ -258,5 +1280,12 @@ diff --git a/foo b/foo
         assert_eq!(Some(0), file_header_index(&headers, 9));
         assert_eq!(Some(1), file_header_index(&headers, 10));
         assert_eq!(Some(1), file_header_index(&headers, 40));
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let output = parse_diff(b"");
+        assert_eq!(true, output.files().is_empty());
+        assert_eq!(true, output.view().lines.is_empty());
     }
 }
