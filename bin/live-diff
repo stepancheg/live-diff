@@ -1,0 +1,11 @@
+#!/bin/sh -e
+
+project_root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Build from the project so rustup uses its toolchain.
+(
+    cd "$project_root"
+    cargo build --quiet
+)
+
+exec "$project_root/target/debug/live-diff" "$@"
