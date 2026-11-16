@@ -90,12 +90,14 @@ pub(crate) fn sl_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
 }
 
 pub(crate) fn git_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
+    // One argv element. `git diff -U N` is two arguments; git 2.55 treats
+    // `-U` like `-u` (a synonym for `-p`) and then reads `N` as a revision.
+    // `--unified=N` is accepted on both old and new git.
     let mut cmd = vec![
         String::from("git"),
         String::from("diff"),
         String::from("--no-ext-diff"),
-        String::from("-U"),
-        context.to_string(),
+        format!("--unified={context}"),
     ];
     if let Some(rev) = rev {
         cmd.push(rev.to_owned());
@@ -267,8 +269,7 @@ mod tests {
                 String::from("git"),
                 String::from("diff"),
                 String::from("--no-ext-diff"),
-                String::from("-U"),
-                String::from("8"),
+                String::from("--unified=8"),
             ],
             crate::repo::git_diff_command(8, None)
         );
@@ -288,8 +289,7 @@ mod tests {
                 String::from("git"),
                 String::from("diff"),
                 String::from("--no-ext-diff"),
-                String::from("-U"),
-                String::from("3"),
+                String::from("--unified=3"),
                 String::from("main"),
             ],
             crate::repo::git_diff_command(3, Some("main"))

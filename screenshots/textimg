@@ -1,0 +1,57 @@
+#!/usr/bin/env dotslash
+
+// textimg v3.2.4 - https://github.com/jiro4989/textimg/releases/tag/v3.2.4
+
+{
+    "name": "textimg",
+    "platforms": {
+        "macos-aarch64": {
+            "size": 1524378,
+            "hash": "blake3",
+            "digest": "5f33a4645989f16e526fdb378297588f8e4a46bd402fb9fccd7972116d162274",
+            "format": "tar.gz",
+            "path": "textimg",
+            "providers": [
+                {
+                    "url": "https://github.com/jiro4989/textimg/releases/download/v3.2.4/textimg-darwin-arm64.tar.gz"
+                }
+            ]
+        },
+        "macos-x86_64": {
+            "size": 1649858,
+            "hash": "blake3",
+            "digest": "d3ad22e2d3672753088ac0ab13bd667f9c996600ccdd0327f10a924bd21f5e69",
+            "format": "tar.gz",
+            "path": "textimg",
+            "providers": [
+                {
+                    "url": "https://github.com/jiro4989/textimg/releases/download/v3.2.4/textimg-darwin-amd64.tar.gz"
+                }
+            ]
+        },
+        "linux-x86_64": {
+            "size": 1620927,
+            "hash": "blake3",
+            "digest": "d0e54a7816a8e4434e8a287f9c2a3908aa55a5085a0b2ae41636a14b4796fc13",
+            "format": "tar.gz",
+            "path": "textimg",
+            "providers": [
+                {
+                    "url": "https://github.com/jiro4989/textimg/releases/download/v3.2.4/textimg-linux-amd64.tar.gz"
+                }
+            ]
+        },
+        "linux-aarch64": {
+            "size": 1461259,
+            "hash": "blake3",
+            "digest": "47d8eac8faa7bf2d7ba5c29c7e58485309cab7d9983cc91f4958ffcf2d7ca357",
+            "format": "tar.gz",
+            "path": "textimg",
+            "providers": [
+                {
+                    "url": "https://github.com/jiro4989/textimg/releases/download/v3.2.4/textimg-linux-arm64.tar.gz"
+                }
+            ]
+        }
+    }
+}
