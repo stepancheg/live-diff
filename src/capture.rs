@@ -117,6 +117,29 @@ async fn capture_interruptible(
     }
 }
 
+/// What the last sent snapshot was built from. Used to skip
+/// `parse_diff` and a UI update when a refresh reproduces the same
+/// bytes. This does not skip the `sl`/`git` processes themselves.
+struct CachedSnapshot {
+    diff: CachedDiff,
+    untracked: CachedUntracked,
+    output: DiffOutput,
+}
+
+#[derive(Eq, PartialEq)]
+enum CachedDiff {
+    Bytes(Vec<u8>),
+    Error(String),
+}
+
+/// `Failed` is a non-zero exit or a spawn error. Both leave the
+/// untracked list empty, matching the previous loop behaviour.
+#[derive(Eq, PartialEq)]
+enum CachedUntracked {
+    Failed,
+    Ok(Vec<u8>),
+}
+
 /// Capture in a loop, sending each snapshot on `tx`.
 /// `refresh` kills the current command and starts the next run at once.
 pub(crate) async fn capture_command_output_loop(
@@ -127,36 +150,81 @@ pub(crate) async fn capture_command_output_loop(
     tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
+    let mut cached: Option<CachedSnapshot> = None;
     loop {
         let command = command_for_tool(tool, context.load(Ordering::SeqCst), rev.as_deref());
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
-        let mut output = match outcome {
+        let diff = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
-            Ok(CaptureOutcome::Done { bytes, .. }) => parse_diff(&bytes),
+            Ok(CaptureOutcome::Done { bytes, .. }) => CachedDiff::Bytes(bytes),
             Err(err) => {
                 let text = format!("error: {err:?}");
-                DiffOutput::message(&text)
+                CachedDiff::Error(text)
             }
         };
         // A failed listing leaves the diff without untracked paths.
         // An interrupt restarts the whole snapshot so the count matches it.
         let untracked_cmd = untracked_command_for_tool(tool);
-        match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
+        let untracked = match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
             Ok(CaptureOutcome::Interrupted) => continue,
             Ok(CaptureOutcome::Done { bytes, success }) => {
                 if success {
-                    output.set_untracked(parse_untracked_paths(&bytes));
+                    CachedUntracked::Ok(bytes)
+                } else {
+                    CachedUntracked::Failed
                 }
             }
-            Err(_) => {}
-        }
-        if tx.send(output).await.is_err() {
-            return;
+            Err(_) => CachedUntracked::Failed,
+        };
+        let unchanged = match &cached {
+            Some(prev) => {
+                if prev.diff == diff {
+                    prev.untracked == untracked
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if unchanged {
+            // Same diff bytes and same untracked listing: keep the
+            // previous DiffOutput and do not notify the UI.
+        } else {
+            let output = match &cached {
+                Some(prev) if prev.diff == diff => {
+                    let mut output = prev.output.clone();
+                    output.set_untracked(untracked_paths(&untracked));
+                    output
+                }
+                _ => {
+                    let mut output = match &diff {
+                        CachedDiff::Bytes(bytes) => parse_diff(bytes),
+                        CachedDiff::Error(text) => DiffOutput::message(text),
+                    };
+                    output.set_untracked(untracked_paths(&untracked));
+                    output
+                }
+            };
+            cached = Some(CachedSnapshot {
+                diff,
+                untracked,
+                output: output.clone(),
+            });
+            if tx.send(output).await.is_err() {
+                return;
+            }
         }
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
             () = refresh.notified() => {}
         }
+    }
+}
+
+fn untracked_paths(untracked: &CachedUntracked) -> Vec<String> {
+    match untracked {
+        CachedUntracked::Failed => Vec::new(),
+        CachedUntracked::Ok(bytes) => parse_untracked_paths(bytes),
     }
 }
 
@@ -263,6 +331,20 @@ mod tests {
             CaptureOutcome::Done { bytes, .. } => Ok(bytes),
             CaptureOutcome::Interrupted => Err(anyhow::anyhow!("capture interrupted")),
         }
+    }
+
+    #[test]
+    fn test_untracked_paths_empty_on_failure() {
+        assert_eq!(
+            Vec::<String>::new(),
+            crate::capture::untracked_paths(&crate::capture::CachedUntracked::Failed)
+        );
+        assert_eq!(
+            vec![String::from("a"), String::from("b")],
+            crate::capture::untracked_paths(&crate::capture::CachedUntracked::Ok(
+                b"b\0a\0".to_vec()
+            ))
+        );
     }
 
     #[test]
