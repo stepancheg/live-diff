@@ -1,14 +1,13 @@
-/// Diff introduced by one commit, the git form of `sl diff -c REV`.
+/// Commit message and diff introduced by one commit (`git show`).
 ///
-/// `git show` prints that patch, including a root commit against the
-/// empty tree. `git diff REV^!` does the same when `REV` has a parent,
-/// but a root commit's `REV^!` is just `REV`, and `git diff REV` then
-/// compares that tree to the work tree.
+/// The default show format prints the message, author, and date, then
+/// the patch. That patch includes a root commit against the empty tree.
+/// `git diff REV^!` is only the patch, and for a root commit `REV^!` is
+/// just `REV`, so `git diff REV` compares that tree to the work tree.
 pub(crate) fn git_commit_diff_command(context: u32, commit: &str) -> Vec<String> {
     vec![
         String::from("git"),
         String::from("show"),
-        String::from("--format="),
         String::from("--no-ext-diff"),
         format!("--unified={context}"),
         commit.to_owned(),

@@ -12,14 +12,14 @@ pub(crate) fn sl_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
     cmd
 }
 
-/// Diff introduced by one commit (`sl diff -c REV`).
+/// Commit message and diff introduced by one commit (`sl show`).
 pub(crate) fn sl_commit_diff_command(context: u32, commit: &str) -> Vec<String> {
     vec![
         String::from("sl"),
-        String::from("diff"),
+        String::from("show"),
         String::from("-U"),
         context.to_string(),
-        String::from("-c"),
+        String::from("-r"),
         commit.to_owned(),
     ]
 }

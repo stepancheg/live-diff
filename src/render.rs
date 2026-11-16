@@ -402,9 +402,13 @@ impl Renderer {
     pub(crate) fn scroll_down(&mut self) {
         // One document row, including file headers. A header is its own
         // stop so crossing into the next file shifts the view by one
-        // line. A header with no hunks stays visible.
+        // line. A header with no hunks stays visible. The first file's
+        // header is not a stop when lines precede it and the file has
+        // a body: there is no previous file to pin, so that row is a
+        // duplicate of the pinned-header view.
         let top = self.viewport_top_row();
-        self.set_top_row(top.saturating_add(WrappedRow(1)));
+        let next = top.saturating_add(WrappedRow(1));
+        self.set_top_row(self.skip_first_header_stop(next, true));
     }
 
     pub(crate) fn scroll_up(&mut self) {
@@ -412,7 +416,8 @@ impl Renderer {
         if top == WrappedRow(0) {
             return;
         }
-        self.set_top_row(top.saturating_sub(WrappedRow(1)));
+        let prev = top.saturating_sub(WrappedRow(1));
+        self.set_top_row(self.skip_first_header_stop(prev, false));
     }
 
     pub(crate) fn scroll_top(&mut self) {
@@ -428,13 +433,15 @@ impl Renderer {
         // Each content slot is one document row. A pinned header's own
         // row stays in the slice as a blank, so a page is `content_rows`.
         let step = cmp::max(layout.content_rows, 1);
-        self.set_top_row(layout.content_start.saturating_add(WrappedRow(step)));
+        let next = layout.content_start.saturating_add(WrappedRow(step));
+        self.set_top_row(self.skip_first_header_stop(next, true));
     }
 
     pub(crate) fn scroll_page_up(&mut self) {
         let layout = self.view_layout();
         let step = cmp::max(layout.content_rows, 1);
-        self.set_top_row(layout.content_start.saturating_sub(WrappedRow(step)));
+        let prev = layout.content_start.saturating_sub(WrappedRow(step));
+        self.set_top_row(self.skip_first_header_stop(prev, false));
     }
 
     pub(crate) fn scroll_to_pos(&mut self, pos: LinePos) {
@@ -817,6 +824,59 @@ impl Renderer {
         }
         let start = total - capacity;
         cmp::max(WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX), min)
+    }
+
+    /// Move `row` off the first file's header when that header is not a
+    /// real scroll stop. `forward` continues toward the file body;
+    /// otherwise toward the lines above the header.
+    fn skip_first_header_stop(&self, row: WrappedRow, forward: bool) -> WrappedRow {
+        let total = self.lines.total();
+        if total == 0 {
+            return row;
+        }
+        let mut row = row;
+        loop {
+            if row.as_usize() >= total {
+                return row;
+            }
+            if !self.row_is_skippable_first_header(row) {
+                return row;
+            }
+            if forward {
+                row = row.saturating_add(WrappedRow(1));
+            } else {
+                if row == WrappedRow(0) {
+                    return row;
+                }
+                row = row.saturating_sub(WrappedRow(1));
+            }
+        }
+    }
+
+    /// The first file's header, when the file has a body and something
+    /// precedes the header. Stopping there draws the same path line as
+    /// the pinned-header view of the body, with no previous file above
+    /// it, so Up/Down must step over it.
+    fn row_is_skippable_first_header(&self, row: WrappedRow) -> bool {
+        if !self.row_is_in_header(row) {
+            return false;
+        }
+        let Some(header) = self.file_header_at_row(row) else {
+            return false;
+        };
+        let line = line_at_visual_row(self.lines.row_counts(), row);
+        let Some(0) = file_header_index(&self.file_headers, line) else {
+            return false;
+        };
+        let body = self.header_end_row(header);
+        if body.as_usize() >= self.lines.total() {
+            return false;
+        }
+        if self.row_is_in_header(body) {
+            return false;
+        }
+        let body_line = line_at_visual_row(self.lines.row_counts(), body);
+        file_header_index(&self.file_headers, body_line) == Some(0)
     }
 
     fn step_content_row_back_from_header(&self, start: WrappedRow) -> Option<WrappedRow> {
@@ -2063,6 +2123,53 @@ diff --git a/foo b/foo
         let mut parser = vt_parser(height, width);
         parser.process(&buf);
         parser
+    }
+
+    #[test]
+    fn test_scroll_past_first_header_after_preamble_is_one_step() {
+        // A commit message (or any text) above the first file makes
+        // that file's header reachable. It must not take two steps:
+        // the stop has no previous file to pin, so the view matches
+        // the pinned-header body and looks unchanged.
+        let mut input = String::from("commit subject\n");
+        input.push_str(&context_file_diff("foo", 8));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        renderer.set_diff(crate::diff::parse_diff(input.as_bytes()));
+        assert_eq!(
+            "commit subject",
+            renderer.lines()[renderer.top_line_index()].plain_text()
+        );
+        renderer.scroll_down();
+        assert_eq!(
+            "@@ -1,8 +1,8 @@",
+            renderer.lines()[renderer.top_line_index()].plain_text()
+        );
+        renderer.scroll_up();
+        assert_eq!(
+            "commit subject",
+            renderer.lines()[renderer.top_line_index()].plain_text()
+        );
+    }
+
+    #[test]
+    fn test_first_header_without_body_after_preamble_is_a_stop() {
+        // A mode-only first file has no hunks. Its header is the only
+        // row, so Up/Down must stop on it.
+        let mut input = String::from("commit subject\n");
+        input.push_str("diff --git a/mode b/mode\nold mode 100644\nnew mode 100755\n");
+        input.push_str(&context_file_diff("foo", 8));
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        renderer.set_diff(crate::diff::parse_diff(input.as_bytes()));
+        renderer.scroll_down();
+        assert_eq!(
+            "mode",
+            renderer.lines()[renderer.top_line_index()].plain_text()
+        );
+        renderer.scroll_up();
+        assert_eq!(
+            "commit subject",
+            renderer.lines()[renderer.top_line_index()].plain_text()
+        );
     }
 
     #[test]

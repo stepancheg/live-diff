@@ -235,7 +235,9 @@ fn check_commit_diff_command_one_commit(repo: &Repo) {
     repo.commit("third");
     write_file(dir, "a.txt", "one\nTWO\nTHREE\nworktree\n");
 
-    let diff = repo.run_diff(repo.commit_diff_command(3, &c2));
+    let stdout = repo.run_ok(&repo.commit_diff_command(3, &c2));
+    assert_commit_message_before_diff(&stdout, "second");
+    let diff = parse_diff(&stdout);
     let files = diff.files();
     assert_eq!(1, files.len());
     assert_eq!(Some(String::from("a.txt")), files[0].old);
@@ -257,7 +259,9 @@ fn check_commit_diff_command_root(repo: &Repo) {
     let c1 = repo.commit("root");
     write_file(dir, "a.txt", "one\ntwo\nworktree\n");
 
-    let diff = repo.run_diff(repo.commit_diff_command(3, &c1));
+    let stdout = repo.run_ok(&repo.commit_diff_command(3, &c1));
+    assert_commit_message_before_diff(&stdout, "root");
+    let diff = parse_diff(&stdout);
     let files = diff.files();
     assert_eq!(1, files.len());
     assert_eq!(None, files[0].old);
@@ -278,7 +282,9 @@ fn check_commit_diff_command_rename(repo: &Repo) {
     fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
     let c2 = repo.commit("rename");
 
-    let diff = repo.run_diff(repo.commit_diff_command(3, &c2));
+    let stdout = repo.run_ok(&repo.commit_diff_command(3, &c2));
+    assert_commit_message_before_diff(&stdout, "rename");
+    let diff = parse_diff(&stdout);
     let files = diff.files();
     assert_eq!(1, files.len());
     assert_eq!(Some(String::from("old.txt")), files[0].old);
@@ -510,6 +516,15 @@ fn apply_env(cmd: &mut Command, root: &Path, home: &Path) {
         .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+0000")
         .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+0000")
         .env("LC_ALL", "C");
+}
+
+fn assert_commit_message_before_diff(stdout: &[u8], message: &str) {
+    let text = String::from_utf8_lossy(stdout);
+    let Some(diff_at) = text.find("diff --git ") else {
+        panic!("commit output had no diff --git header:\n{text}");
+    };
+    let preamble = &text[..diff_at];
+    assert_eq!(true, preamble.contains(message));
 }
 
 fn hunk_lines(file: &FileDiff) -> Vec<(HunkLineKind, String)> {

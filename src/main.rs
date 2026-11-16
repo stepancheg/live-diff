@@ -66,9 +66,9 @@ struct Args {
     #[clap(short = 'r', long = "rev", conflicts_with = "commit")]
     rev: Option<String>,
 
-    /// Show only the diff introduced by this commit (`sl diff -c`,
-    /// `git show`). The commit is immutable, so the diff is
-    /// captured once and not refreshed on an interval.
+    /// Show this commit's message and diff (`sl show`, `git show`).
+    /// The commit is immutable, so the diff is captured once and not
+    /// refreshed on an interval.
     #[clap(short = 'c', long = "change", conflicts_with = "rev")]
     commit: Option<String>,
 
