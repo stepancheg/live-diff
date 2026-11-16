@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::diff::DiffOutput;
 use crate::diff::FileHeaderSpan;
+use crate::diff::FileKey;
 use crate::diff::file_header_index;
 use crate::height::Height;
 use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
@@ -55,6 +56,38 @@ pub(crate) struct Renderer {
     /// File-header spans in the projected diff view. Empty when `lines`
     /// were set directly (help text, or a non-diff test buffer).
     file_headers: Vec<FileHeaderSpan>,
+    /// File identity for each entry in `file_headers`.
+    file_keys: Vec<FileKey>,
+}
+
+/// Stable viewport location across diff refreshes.
+///
+/// A flat line index moves when a file above is inserted or removed.
+/// This anchor names the file and the offset inside it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ScrollAnchor {
+    /// Plain buffer with no file headers (help text, a message).
+    Line {
+        line: usize,
+        offset: usize,
+        text: String,
+    },
+    /// Text before the first file header.
+    Preamble {
+        line: usize,
+        offset: usize,
+        text: String,
+    },
+    File {
+        key: FileKey,
+        /// Index of the file when the anchor was taken. Used when that
+        /// file has disappeared, so we stay in the same slot.
+        index: usize,
+        /// Projected lines from this file's header line. 0 is the header.
+        line_offset: usize,
+        offset: usize,
+        text: String,
+    },
 }
 
 /// Active search highlight. `current` is the selected match's line and byte offset.
@@ -87,6 +120,7 @@ impl Renderer {
             content_gen: 0,
             size,
             file_headers: Vec::new(),
+            file_keys: Vec::new(),
         }
     }
 
@@ -139,6 +173,7 @@ impl Renderer {
     pub(crate) fn set_lines(&mut self, lines: Vec<Line>) {
         self.content_gen = self.content_gen.wrapping_add(1);
         self.file_headers = Vec::new();
+        self.file_keys = Vec::new();
         self.lines = LinesWithWrappedRowCount::new(lines, self.size.width);
         self.clamp_pos_to_lines();
         let top = self.viewport_top_row();
@@ -146,15 +181,199 @@ impl Renderer {
     }
 
     /// Replace the buffer with a parsed diff. Display lines and pinned
-    /// headers are projected from the file-diff structure.
+    /// headers are projected from the file-diff structure. The viewport
+    /// is restored by file identity and offset within that file, not by
+    /// the previous flat line index.
     pub(crate) fn set_diff(&mut self, output: DiffOutput) {
+        let anchor = self.anchor_at(self.top_pos());
         let view = output.view();
         self.content_gen = self.content_gen.wrapping_add(1);
         self.file_headers = view.headers;
+        self.file_keys = view.keys;
         self.lines = LinesWithWrappedRowCount::new(view.lines, self.size.width);
+        self.pos = self.pos_for_anchor(&anchor);
         self.clamp_pos_to_lines();
         let top = self.viewport_top_row();
         self.set_top_row(top);
+    }
+
+    /// Describe `pos` in file + offset terms against the current buffer.
+    pub(crate) fn anchor_at(&self, pos: LinePos) -> ScrollAnchor {
+        let text = self.line_text(pos.line);
+        if self.file_headers.is_empty() || self.file_keys.len() != self.file_headers.len() {
+            return ScrollAnchor::Line {
+                line: pos.line,
+                offset: pos.offset,
+                text,
+            };
+        }
+        match file_header_index(&self.file_headers, pos.line) {
+            None => ScrollAnchor::Preamble {
+                line: pos.line,
+                offset: pos.offset,
+                text,
+            },
+            Some(index) => {
+                let start = self.file_headers[index].start;
+                ScrollAnchor::File {
+                    key: self.file_keys[index].clone(),
+                    index,
+                    line_offset: pos.line.saturating_sub(start),
+                    offset: pos.offset,
+                    text,
+                }
+            }
+        }
+    }
+
+    /// Map an anchor onto the current buffer.
+    pub(crate) fn pos_for_anchor(&self, anchor: &ScrollAnchor) -> LinePos {
+        match anchor {
+            ScrollAnchor::Line { line, offset, text } => {
+                let line = self.line_near(*line, text);
+                LinePos {
+                    line,
+                    offset: *offset,
+                }
+            }
+            ScrollAnchor::Preamble { line, offset, text } => {
+                let limit = self
+                    .file_headers
+                    .first()
+                    .map(|h| h.start)
+                    .unwrap_or(self.lines.len());
+                let line = if limit == 0 {
+                    0
+                } else {
+                    let hint = (*line).min(limit - 1);
+                    self.line_near_in(hint, 0, limit, text)
+                };
+                LinePos {
+                    line,
+                    offset: *offset,
+                }
+            }
+            ScrollAnchor::File {
+                key,
+                index,
+                line_offset,
+                offset,
+                text,
+            } => {
+                let Some((file_index, key_matched)) = self.find_file(key, *index) else {
+                    return LinePos { line: 0, offset: 0 };
+                };
+                let (start, end) = self.file_section(file_index);
+                if start >= end {
+                    return LinePos {
+                        line: start.min(self.lines.len().saturating_sub(1)),
+                        offset: 0,
+                    };
+                }
+                // The file we were in is gone: stay in that slot, at the
+                // replacement file's header.
+                if !key_matched {
+                    return LinePos {
+                        line: start,
+                        offset: 0,
+                    };
+                }
+                let hint = start.saturating_add(*line_offset).min(end - 1);
+                let line = if text.is_empty() {
+                    hint
+                } else {
+                    self.line_near_in(hint, start, end, text)
+                };
+                LinePos {
+                    line,
+                    offset: *offset,
+                }
+            }
+        }
+    }
+
+    /// `(file index, true)` when `key` is still present. If the file
+    /// was deleted, `(slot, false)` where slot is the old index clamped
+    /// into the new file list.
+    fn find_file(&self, key: &FileKey, index: usize) -> Option<(usize, bool)> {
+        let mut found: Option<usize> = None;
+        for (i, candidate) in self.file_keys.iter().enumerate() {
+            if candidate != key {
+                continue;
+            }
+            found = Some(match found {
+                None => i,
+                Some(prev) => {
+                    if i.abs_diff(index) < prev.abs_diff(index) {
+                        i
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+        if let Some(i) = found {
+            return Some((i, true));
+        }
+        if self.file_keys.is_empty() {
+            None
+        } else {
+            Some((index.min(self.file_keys.len() - 1), false))
+        }
+    }
+
+    /// Half-open projected-line range covered by file `index`, from its
+    /// header through the line before the next header (or EOF).
+    fn file_section(&self, index: usize) -> (usize, usize) {
+        let Some(header) = self.file_headers.get(index) else {
+            return (0, 0);
+        };
+        let end = self
+            .file_headers
+            .get(index + 1)
+            .map(|h| h.start)
+            .unwrap_or(self.lines.len());
+        (header.start, end)
+    }
+
+    fn line_text(&self, line: usize) -> String {
+        match self.lines.lines().get(line) {
+            Some(line) => line.plain_text(),
+            None => String::new(),
+        }
+    }
+
+    fn line_near(&self, hint: usize, text: &str) -> usize {
+        let len = self.lines.len();
+        if len == 0 {
+            return 0;
+        }
+        let hint = hint.min(len - 1);
+        if text.is_empty() {
+            return hint;
+        }
+        self.line_near_in(hint, 0, len, text)
+    }
+
+    fn line_near_in(&self, hint: usize, start: usize, end: usize, text: &str) -> usize {
+        if start >= end || self.lines.is_empty() {
+            return start.min(self.lines.len().saturating_sub(1));
+        }
+        let hint = hint.clamp(start, end - 1);
+        if self.line_text(hint) == text {
+            return hint;
+        }
+        let mut dist = 1usize;
+        while dist < end - start {
+            if hint >= start + dist && self.line_text(hint - dist) == text {
+                return hint - dist;
+            }
+            if hint + dist < end && self.line_text(hint + dist) == text {
+                return hint + dist;
+            }
+            dist += 1;
+        }
+        hint
     }
 
     pub(crate) fn scroll_down(&mut self) {
@@ -1836,6 +2055,54 @@ mod tests {
         assert_eq!("bar", row_text(&on_bar, 0, 40));
         assert_eq!("@@ -1,10 +1,10 @@", row_text(&on_bar, 1, 40));
         assert_eq!(" line0", row_text(&on_bar, 2, 40));
+    }
+
+    #[test]
+    fn test_set_diff_keeps_file_when_earlier_file_removed() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        let mut first = context_file_diff("aaa", 10);
+        first.push_str(&context_file_diff("bbb", 10));
+        first.push_str(&context_file_diff("ccc", 10));
+        renderer.set_diff(crate::diff::parse_diff(first.as_bytes()));
+        renderer.scroll_to_file(2);
+        // Move onto a body line inside ccc, not the @@ header.
+        renderer.scroll_down();
+        renderer.scroll_down();
+        let before = renderer.lines()[renderer.top_pos().line].plain_text();
+        assert_eq!(" line1", before);
+        assert_eq!(Some(2), renderer.current_file_index());
+
+        let mut second = context_file_diff("bbb", 10);
+        second.push_str(&context_file_diff("ccc", 10));
+        renderer.set_diff(crate::diff::parse_diff(second.as_bytes()));
+        assert_eq!(Some(1), renderer.current_file_index());
+        assert_eq!(
+            before,
+            renderer.lines()[renderer.top_pos().line].plain_text()
+        );
+    }
+
+    #[test]
+    fn test_set_diff_deleted_file_stays_in_slot() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        let mut first = context_file_diff("aaa", 10);
+        first.push_str(&context_file_diff("bbb", 10));
+        first.push_str(&context_file_diff("ccc", 10));
+        renderer.set_diff(crate::diff::parse_diff(first.as_bytes()));
+        renderer.scroll_to_file(1);
+        renderer.scroll_down();
+        renderer.scroll_down();
+        assert_eq!(Some(1), renderer.current_file_index());
+
+        // bbb is gone. The slot it occupied is now ccc; land on ccc's header.
+        let mut second = context_file_diff("aaa", 10);
+        second.push_str(&context_file_diff("ccc", 10));
+        renderer.set_diff(crate::diff::parse_diff(second.as_bytes()));
+        assert_eq!(Some(1), renderer.current_file_index());
+        assert_eq!(
+            "ccc",
+            renderer.lines()[renderer.top_pos().line].plain_text()
+        );
     }
 
     #[test]

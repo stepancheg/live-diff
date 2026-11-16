@@ -73,11 +73,29 @@ pub(crate) struct FileHeaderSpan {
     pub(crate) end: usize,
 }
 
+/// Identity of a diff file, used to restore the viewport across refreshes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileKey {
+    pub(crate) old: Option<String>,
+    pub(crate) new: Option<String>,
+}
+
+impl FileKey {
+    pub(crate) fn of(file: &FileDiff) -> FileKey {
+        FileKey {
+            old: file.old.clone(),
+            new: file.new.clone(),
+        }
+    }
+}
+
 /// Display lines built from a [`DiffOutput`], plus the header span of
 /// each file in those lines.
 pub(crate) struct DiffView {
     pub(crate) lines: Vec<Line>,
     pub(crate) headers: Vec<FileHeaderSpan>,
+    /// Parallel to `headers`.
+    pub(crate) keys: Vec<FileKey>,
 }
 
 impl DiffOutput {
@@ -106,6 +124,7 @@ impl DiffOutput {
     pub(crate) fn view(&self) -> DiffView {
         let mut lines = Vec::new();
         let mut headers = Vec::new();
+        let mut keys = Vec::new();
         let mut i = 0;
         while i < self.segments.len() {
             match &self.segments[i] {
@@ -133,12 +152,17 @@ impl DiffOutput {
                     ));
                     let end = lines.len();
                     headers.push(FileHeaderSpan { start, end });
+                    keys.push(FileKey::of(file));
                     push_file_body(file, &mut lines);
                     i += 1;
                 }
             }
         }
-        DiffView { lines, headers }
+        DiffView {
+            lines,
+            headers,
+            keys,
+        }
     }
 }
 

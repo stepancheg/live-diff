@@ -22,6 +22,7 @@ use crate::mark::Marks;
 use crate::mark::NOT_SET;
 use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
+use crate::render::ScrollAnchor;
 use crate::repo::step_context;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
@@ -189,9 +190,20 @@ impl EventLoop {
 
     fn on_command_output(&mut self, output: DiffOutput) -> anyhow::Result<()> {
         let anchor = self.search.anchor(self.renderer.lines());
+        let mark_anchors: Vec<(char, ScrollAnchor)> = self
+            .marks
+            .rows
+            .iter()
+            .map(|(&name, &pos)| (name, self.renderer.anchor_at(pos)))
+            .collect();
         self.retain_file_list_selection(&output);
         self.output = output.clone();
         self.renderer.set_diff(output);
+        for (name, mark_anchor) in mark_anchors {
+            self.marks
+                .rows
+                .insert(name, self.renderer.pos_for_anchor(&mark_anchor));
+        }
         self.search.reattach(self.renderer.lines(), anchor);
         self.search.apply_highlight(&mut self.renderer);
         if !matches!(self.mode, Mode::Prompt(_) | Mode::Dash | Mode::Mark(_)) {
