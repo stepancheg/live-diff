@@ -1,5 +1,8 @@
 use std::io;
 use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
@@ -18,6 +21,7 @@ use crate::mark::Marks;
 use crate::mark::NOT_SET;
 use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
+use crate::repo::step_context;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
@@ -62,10 +66,17 @@ pub(crate) struct EventLoop {
     marks: Marks,
     mode: Mode,
     size: Size,
+    /// Unified diff context (`-U`). The capture loop reads this each run.
+    context: Arc<AtomicU32>,
 }
 
 impl EventLoop {
-    pub(crate) fn new(terminal_bg: TerminalBg, history: History, size: Size) -> EventLoop {
+    pub(crate) fn new(
+        terminal_bg: TerminalBg,
+        history: History,
+        size: Size,
+        context: Arc<AtomicU32>,
+    ) -> EventLoop {
         EventLoop {
             renderer: Renderer::new(terminal_bg, size),
             help_renderer: Renderer::new(terminal_bg, size),
@@ -74,6 +85,7 @@ impl EventLoop {
             marks: Marks::default(),
             mode: Mode::Output,
             size,
+            context,
         }
     }
 
@@ -348,6 +360,21 @@ impl EventLoop {
         Ok(KeyResult::Continue)
     }
 
+    fn change_context(&mut self, action: KeyAction) -> anyhow::Result<KeyResult> {
+        let increase = matches!(action, KeyAction::ContextMore);
+        let current = self.context.load(Ordering::SeqCst);
+        let next = step_context(current, increase);
+        self.context.store(next, Ordering::SeqCst);
+        self.renderer
+            .set_status_label(Some(format!("context {next}")));
+        self.renderer.redraw(&mut io::stdout())?;
+        if next == current {
+            Ok(KeyResult::Continue)
+        } else {
+            Ok(KeyResult::Refresh)
+        }
+    }
+
     fn on_help_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
@@ -369,6 +396,10 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
+            KeyAction::ContextLess | KeyAction::ContextMore => {
+                self.mode = Mode::Output;
+                self.change_context(action)
+            }
             KeyAction::Dash => Ok(KeyResult::Continue),
             KeyAction::SearchForward
             | KeyAction::SearchBackward
@@ -421,6 +452,7 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
+            KeyAction::ContextLess | KeyAction::ContextMore => self.change_context(action),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
@@ -525,6 +557,8 @@ fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<(
         | KeyAction::DismissMessage
         | KeyAction::Dash
         | KeyAction::Refresh
+        | KeyAction::ContextLess
+        | KeyAction::ContextMore
         | KeyAction::SearchForward
         | KeyAction::SearchBackward
         | KeyAction::SearchNext
@@ -555,6 +589,8 @@ enum KeyAction {
     Redraw,
     SetMark,
     GotoMark,
+    ContextLess,
+    ContextMore,
 }
 
 fn is_dismissable_status(status: &str) -> bool {
@@ -562,6 +598,7 @@ fn is_dismissable_status(status: &str) -> bool {
         || status == NO_PREVIOUS_SEARCH
         || status == INVALID_PATTERN
         || status == NOT_SET
+        || status.starts_with("context ")
         || is_case_mode_status(status)
 }
 
@@ -595,6 +632,18 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('G') | KeyCode::End => Some(KeyAction::ScrollBottom),
         KeyCode::Char(' ') | KeyCode::PageDown => Some(KeyAction::ScrollPageDown),
         KeyCode::PageUp => Some(KeyAction::ScrollPageUp),
+        KeyCode::Char('u')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(KeyAction::ContextLess)
+        }
+        KeyCode::Char('U')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(KeyAction::ContextMore)
+        }
         _ => None,
     }
 }

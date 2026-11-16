@@ -23,6 +23,7 @@ use std::io;
 use std::panic;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -37,9 +38,9 @@ use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyTx;
 use crate::render::terminal_size;
-use crate::repo::diff_command;
-use crate::repo::git_diff_command;
-use crate::repo::sl_diff_command;
+use crate::repo::DEFAULT_CONTEXT;
+use crate::repo::DiffTool;
+use crate::repo::diff_tool;
 use crate::search::history::store::History;
 use crate::terminal_bg::query_terminal_bg;
 use crate::terminal_guard::TerminalGuard;
@@ -71,13 +72,14 @@ fn install_panic_hook() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let command = if args.sl {
-        sl_diff_command()
+    let tool = if args.sl {
+        DiffTool::Sl
     } else if args.git {
-        git_diff_command()
+        DiffTool::Git
     } else {
-        diff_command()?
+        diff_tool()?
     };
+    let context = Arc::new(AtomicU32::new(DEFAULT_CONTEXT));
     let history = History::load_from_home().await;
 
     // Capture the first snapshot on the primary screen so the alternate
@@ -85,7 +87,8 @@ async fn main() -> anyhow::Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
-        command,
+        tool,
+        Arc::clone(&context),
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
     let (_key_reader, keys) = spawn_key_reader(stop);
 
-    EventLoop::new(terminal_bg, history, size)
+    EventLoop::new(terminal_bg, history, size, context)
         .run(first_lines, output_rx, keys, refresh_tx, capture_task)
         .await
 }

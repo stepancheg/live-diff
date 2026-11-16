@@ -4,6 +4,9 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -14,6 +17,8 @@ use tokio::sync::mpsc::Sender;
 use crate::diff::DiffOutput;
 use crate::diff::parse_diff;
 use crate::notify_pair::NotifyRx;
+use crate::repo::DiffTool;
+use crate::repo::command_for_tool;
 
 /// Result of a capture that may be cut short by `interrupt`.
 pub(crate) enum CaptureOutcome {
@@ -82,12 +87,14 @@ pub(crate) async fn capture_command_output_interruptible(
 /// Capture in a loop, sending each snapshot on `tx`.
 /// `refresh` kills the current command and starts the next run at once.
 pub(crate) async fn capture_command_output_loop(
-    command: Vec<String>,
+    tool: DiffTool,
+    context: Arc<AtomicU32>,
     interval: Duration,
     tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
     loop {
+        let command = command_for_tool(tool, context.load(Ordering::SeqCst));
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let output = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,

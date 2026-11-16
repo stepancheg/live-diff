@@ -6,7 +6,7 @@ Keys
 
   h              Show this help
   q              Quit
-  r              Run the command now (kills the current run)
+  r              Run the diff command now
   j, Down, Enter Scroll down
   k, Up          Scroll up
   Space, PgDn    Page down
@@ -19,6 +19,8 @@ Keys
   N              Repeat search in reverse
   mx             Mark current position as x
   'x             Go to mark x
+  u              Decrease context
+  U              Increase context
   -i             Toggle ignore case
   -I             Always ignore case
   ^l             Redraw
@@ -86,6 +88,8 @@ mod tests {
             text.contains("mx             Mark current position as x")
         );
         assert_eq!(true, text.contains("'x             Go to mark x"));
+        assert_eq!(true, text.contains("u              Decrease context"));
+        assert_eq!(true, text.contains("U              Increase context"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));
     }
 

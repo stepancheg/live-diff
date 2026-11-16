@@ -10,59 +10,87 @@ use anyhow::bail;
 /// directory, or `.git/sl`). Probing does not run `sl`: `sl root` creates
 /// `.git/sl` in a plain git repository. Otherwise the repository is
 /// treated as git.
+/// Git and sl default to 3 lines of unified context.
+pub(crate) const DEFAULT_CONTEXT: u32 = 3;
+/// Upper bound so holding `U` cannot request an enormous diff.
+pub(crate) const MAX_CONTEXT: u32 = 999;
+
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn diff_command_in(dir: &Path) -> anyhow::Result<Vec<String>> {
-    match repo_kind(dir)? {
-        RepoKind::Sl => Ok(sl_diff_command()),
-        RepoKind::Git => Ok(git_diff_command()),
+    Ok(command_for_tool(diff_tool_in(dir)?, DEFAULT_CONTEXT))
+}
+
+pub(crate) fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
+    repo_kind(dir)
+}
+
+pub(crate) fn diff_tool() -> anyhow::Result<DiffTool> {
+    let dir = std::env::current_dir()?;
+    diff_tool_in(&dir)
+}
+
+pub(crate) fn command_for_tool(tool: DiffTool, context: u32) -> Vec<String> {
+    match tool {
+        DiffTool::Sl => sl_diff_command(context),
+        DiffTool::Git => git_diff_command(context),
     }
 }
 
-pub(crate) fn sl_diff_command() -> Vec<String> {
+pub(crate) fn sl_diff_command(context: u32) -> Vec<String> {
     vec![
         String::from("sl"),
         String::from("diff"),
+        String::from("-U"),
+        context.to_string(),
         String::from("-r"),
         String::from("prev"),
     ]
 }
 
-pub(crate) fn git_diff_command() -> Vec<String> {
+pub(crate) fn git_diff_command(context: u32) -> Vec<String> {
     vec![
         String::from("git"),
         String::from("diff"),
         String::from("--no-ext-diff"),
+        String::from("-U"),
+        context.to_string(),
         String::from("HEAD^"),
     ]
 }
 
-pub(crate) fn diff_command() -> anyhow::Result<Vec<String>> {
-    let dir = std::env::current_dir()?;
-    diff_command_in(&dir)
+/// Next context size after `u` (decrease) or `U` (increase).
+/// Stays put at 0 and at [`MAX_CONTEXT`].
+pub(crate) fn step_context(context: u32, increase: bool) -> u32 {
+    if increase {
+        context.saturating_add(1).min(MAX_CONTEXT)
+    } else {
+        context.saturating_sub(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RepoKind {
+pub(crate) enum DiffTool {
     Sl,
     Git,
 }
 
-fn repo_kind(start: &Path) -> anyhow::Result<RepoKind> {
+fn repo_kind(start: &Path) -> anyhow::Result<DiffTool> {
     for dir in start.ancestors() {
         if dir.join(".sl").is_dir() {
-            return Ok(RepoKind::Sl);
+            return Ok(DiffTool::Sl);
         }
         let dot_git = dir.join(".git");
         if dot_git.is_dir() {
             if dot_git.join("sl").is_dir() {
-                return Ok(RepoKind::Sl);
+                return Ok(DiffTool::Sl);
             }
-            return Ok(RepoKind::Git);
+            return Ok(DiffTool::Git);
         }
         if dot_git.is_file() {
             if gitfile_has_sl(&dot_git)? {
-                return Ok(RepoKind::Sl);
+                return Ok(DiffTool::Sl);
             }
-            return Ok(RepoKind::Git);
+            return Ok(DiffTool::Git);
         }
     }
     bail!("not an sl or git repository")
@@ -108,11 +136,49 @@ mod tests {
     use crate::repo::diff_command_in;
 
     fn sl_argv() -> Vec<String> {
-        crate::repo::sl_diff_command()
+        crate::repo::sl_diff_command(crate::repo::DEFAULT_CONTEXT)
     }
 
     fn git_argv() -> Vec<String> {
-        crate::repo::git_diff_command()
+        crate::repo::git_diff_command(crate::repo::DEFAULT_CONTEXT)
+    }
+
+    #[test]
+    fn test_step_context_clamps() {
+        assert_eq!(0, crate::repo::step_context(0, false));
+        assert_eq!(1, crate::repo::step_context(0, true));
+        assert_eq!(2, crate::repo::step_context(3, false));
+        assert_eq!(4, crate::repo::step_context(3, true));
+        assert_eq!(
+            crate::repo::MAX_CONTEXT,
+            crate::repo::step_context(crate::repo::MAX_CONTEXT, true)
+        );
+    }
+
+    #[test]
+    fn test_command_includes_unified_context() {
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("diff"),
+                String::from("-U"),
+                String::from("5"),
+                String::from("-r"),
+                String::from("prev"),
+            ],
+            crate::repo::sl_diff_command(5)
+        );
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("diff"),
+                String::from("--no-ext-diff"),
+                String::from("-U"),
+                String::from("8"),
+                String::from("HEAD^"),
+            ],
+            crate::repo::git_diff_command(8)
+        );
     }
 
     #[test]
