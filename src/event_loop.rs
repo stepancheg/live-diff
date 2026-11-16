@@ -51,7 +51,11 @@ enum KeyResult {
 
 enum Mode {
     Output,
-    Help,
+    /// Help page. `from_files` is set when help was opened from the
+    /// diff stat, so q/h return to that list.
+    Help {
+        from_files: bool,
+    },
     /// File list: one row per diff file. Enter jumps to that file.
     Files,
     Prompt(Prompt),
@@ -173,7 +177,7 @@ impl EventLoop {
         self.renderer.update_size(self.size);
         self.help_renderer.update_size(self.size);
         match self.mode {
-            Mode::Help | Mode::Files => {
+            Mode::Help { .. } | Mode::Files => {
                 self.help_renderer.redraw(&mut io::stdout())?;
             }
             _ => {
@@ -216,7 +220,7 @@ impl EventLoop {
             self.renderer.set_status_label(label);
         }
         match self.mode {
-            Mode::Help => {}
+            Mode::Help { .. } => {}
             // In-place refresh. `draw` skips the terminal write when the
             // visible list is unchanged, so a text selection survives.
             Mode::Files => self.paint_file_list(false)?,
@@ -236,7 +240,7 @@ impl EventLoop {
                 let op = *op;
                 self.on_mark_key(key, op)
             }
-            Mode::Help => self.on_help_key(key),
+            Mode::Help { .. } => self.on_help_key(key),
             Mode::Files => self.on_files_key(key),
             Mode::Output => self.on_output_key(key),
         }
@@ -415,6 +419,21 @@ impl EventLoop {
         Ok(KeyResult::Continue)
     }
 
+    /// Leave help for the view it was opened from. The stat page and
+    /// help share `help_renderer`, so returning to the list must paint
+    /// over the help text.
+    fn close_help(&mut self) -> anyhow::Result<()> {
+        let from_files = matches!(self.mode, Mode::Help { from_files: true });
+        if from_files {
+            self.mode = Mode::Files;
+            self.paint_file_list(true)?;
+        } else {
+            self.mode = Mode::Output;
+            self.renderer.redraw(&mut io::stdout())?;
+        }
+        Ok(())
+    }
+
     fn open_selected_file(&mut self) -> anyhow::Result<KeyResult> {
         let n_files = self.output.files().len();
         // Untracked rows have no diff to open; stay on the stat page.
@@ -540,8 +559,8 @@ impl EventLoop {
             KeyAction::FileList => self.open_selected_file(),
             KeyAction::DismissMessage => self.close_file_list(),
             KeyAction::Help => {
-                // Leave the list and show help.
-                self.mode = Mode::Help;
+                // Leave the list and show help. Closing help returns here.
+                self.mode = Mode::Help { from_files: true };
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.scroll_top();
@@ -623,8 +642,7 @@ impl EventLoop {
         };
         match action {
             KeyAction::Quit | KeyAction::Help => {
-                self.mode = Mode::Output;
-                self.renderer.redraw(&mut io::stdout())?;
+                self.close_help()?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -639,8 +657,18 @@ impl EventLoop {
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::ContextLess | KeyAction::ContextMore => {
-                self.mode = Mode::Output;
-                self.change_context(action)
+                let from_files = matches!(self.mode, Mode::Help { from_files: true });
+                if from_files {
+                    // Same as u/U on the stat page: change context and
+                    // stay on the list.
+                    let result = self.change_context(action)?;
+                    self.mode = Mode::Files;
+                    self.paint_file_list(true)?;
+                    Ok(result)
+                } else {
+                    self.mode = Mode::Output;
+                    self.change_context(action)
+                }
             }
             KeyAction::FileList => Ok(KeyResult::Continue),
             KeyAction::Dash => Ok(KeyResult::Continue),
@@ -688,7 +716,7 @@ impl EventLoop {
             }
             KeyAction::Quit => Ok(KeyResult::Quit),
             KeyAction::Help => {
-                self.mode = Mode::Help;
+                self.mode = Mode::Help { from_files: false };
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.scroll_top();
                 self.help_renderer.redraw(&mut io::stdout())?;
