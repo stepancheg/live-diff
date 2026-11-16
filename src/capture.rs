@@ -1,7 +1,6 @@
 use std::io;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -105,7 +104,7 @@ async fn capture_interruptible(
                 let status = status?;
                 // Do not wait for EOF: a grandchild may still hold the write end.
                 // Drop the tokio registration and read whatever is already buffered.
-                drain_nonblocking(reader.into_nonblocking_fd()?, &mut out)?;
+                drain_nonblocking(reader, &mut out)?;
                 let success = status.success();
                 append_nonzero_status(&status, &mut out);
                 return Ok(CaptureOutcome::Done {
@@ -270,9 +269,15 @@ fn read_ready(
 }
 
 /// Append bytes already buffered on `reader`. Stop at EOF or when a read would block.
-fn drain_nonblocking(fd: OwnedFd, out: &mut Vec<u8>) -> anyhow::Result<()> {
+///
+/// Deregisters the tokio pipe and reads the underlying fd. A grandchild
+/// may still hold the write end, so this must not block for EOF.
+fn drain_nonblocking(reader: pipe::Receiver, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    // into_nonblocking_fd deregisters the pipe and returns the fd still
+    // in nonblocking mode (from_owned_fd set O_NONBLOCK; only
+    // into_blocking_fd clears it).
+    let fd = reader.into_nonblocking_fd()?;
     let mut reader = io::PipeReader::from(fd);
-    set_nonblocking(&reader)?;
     let mut buf = [0_u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -299,21 +304,6 @@ fn append_nonzero_status(status: &std::process::ExitStatus, out: &mut Vec<u8>) {
     out.extend_from_slice(line.as_bytes());
 }
 
-fn set_nonblocking(fd: &impl AsRawFd) -> anyhow::Result<()> {
-    let fd = fd.as_raw_fd();
-    // SAFETY: `fd` is an open file descriptor we own for the length of the call.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    // SAFETY: same fd; F_SETFL with the existing flags plus O_NONBLOCK.
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -321,6 +311,8 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    use tokio::net::unix::pipe;
 
     use crate::capture::CaptureOutcome;
     use crate::capture::capture_command_output_interruptible;
@@ -347,34 +339,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_drain_nonblocking_reads_buffer_and_stops_with_writer_open() {
+    fn receiver_from_pipe(reader: std::io::PipeReader) -> pipe::Receiver {
+        pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_drain_nonblocking_reads_buffer_and_stops_with_writer_open() {
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(b"hello").unwrap();
         let mut out = Vec::new();
         out.extend_from_slice(b"pre");
         // Writer stays open, so a blocking read would wait for EOF.
-        drain_nonblocking(OwnedFd::from(reader), &mut out).unwrap();
+        drain_nonblocking(receiver_from_pipe(reader), &mut out).unwrap();
         assert_eq!(b"prehello".as_slice(), out.as_slice());
         drop(writer);
     }
 
-    #[test]
-    fn test_drain_nonblocking_empty_pipe_with_writer_open() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_drain_nonblocking_empty_pipe_with_writer_open() {
         let (reader, writer) = std::io::pipe().unwrap();
         let mut out = Vec::new();
-        drain_nonblocking(OwnedFd::from(reader), &mut out).unwrap();
+        drain_nonblocking(receiver_from_pipe(reader), &mut out).unwrap();
         assert_eq!(Vec::<u8>::new(), out);
         drop(writer);
     }
 
-    #[test]
-    fn test_drain_nonblocking_reads_to_eof() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_drain_nonblocking_reads_to_eof() {
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(b"abc").unwrap();
         drop(writer);
         let mut out = Vec::new();
-        drain_nonblocking(OwnedFd::from(reader), &mut out).unwrap();
+        drain_nonblocking(receiver_from_pipe(reader), &mut out).unwrap();
         assert_eq!(b"abc".as_slice(), out.as_slice());
     }
 
