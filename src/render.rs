@@ -10,6 +10,9 @@ use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use unicode_width::UnicodeWidthChar;
 
+use crate::diff::FileHeader;
+use crate::diff::file_header_index;
+use crate::diff::file_headers;
 use crate::height::Height;
 use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
 use crate::size::Size;
@@ -49,6 +52,8 @@ pub(crate) struct Renderer {
     content_gen: u64,
     /// Terminal size last given to [`Renderer::update_size`] (or `new`).
     size: Size,
+    /// Diff file headers in `lines`, used to pin the current file header.
+    file_headers: Vec<FileHeader>,
 }
 
 /// Active search highlight. `current` is the selected match's line and byte offset.
@@ -80,6 +85,7 @@ impl Renderer {
             highlight: None,
             content_gen: 0,
             size,
+            file_headers: Vec::new(),
         }
     }
 
@@ -131,6 +137,7 @@ impl Renderer {
 
     pub(crate) fn set_lines(&mut self, lines: Vec<Line>) {
         self.content_gen = self.content_gen.wrapping_add(1);
+        self.file_headers = file_headers(&lines);
         self.lines = LinesWithWrappedRowCount::new(lines, self.size.width);
         self.clamp_pos_to_lines();
         let top = self.viewport_top_row();
@@ -156,15 +163,15 @@ impl Renderer {
     }
 
     pub(crate) fn scroll_page_down(&mut self) {
-        let step = cmp::max(content_height(self.size.height), 1);
-        let top = self.viewport_top_row();
-        self.set_top_row(top.saturating_add(WrappedRow(step)));
+        let layout = self.view_layout();
+        let step = cmp::max(layout.content_rows, 1);
+        self.set_top_row(layout.content_start.saturating_add(WrappedRow(step)));
     }
 
     pub(crate) fn scroll_page_up(&mut self) {
-        let step = cmp::max(content_height(self.size.height), 1);
-        let top = self.viewport_top_row();
-        self.set_top_row(top.saturating_sub(WrappedRow(step)));
+        let layout = self.view_layout();
+        let step = cmp::max(layout.content_rows, 1);
+        self.set_top_row(layout.content_start.saturating_sub(WrappedRow(step)));
     }
 
     pub(crate) fn scroll_to_pos(&mut self, pos: LinePos) {
@@ -194,11 +201,15 @@ impl Renderer {
             self.set_top_row(match_row);
             return;
         }
-        let top = self.viewport_top_row();
-        let bottom = top.saturating_add(WrappedRow(body - 1));
-        if match_row < top || match_row > bottom {
-            self.set_top_row(match_row.saturating_sub(WrappedRow(body / 2)));
+        if self.row_visible(match_row) {
+            return;
         }
+        // Center inside the content area that remains under the pin the
+        // match's row would show. A hit in a file header has no pin at
+        // that row, so the full body height is used.
+        let pin = self.pin_visual_rows_for_content_row(match_row);
+        let capacity = cmp::max(content_capacity(body, pin), 1);
+        self.set_top_row(match_row.saturating_sub(WrappedRow(capacity / 2)));
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
@@ -229,18 +240,16 @@ impl Renderer {
             return 0;
         }
         let total = self.lines.total();
-        let body = content_height(self.size.height);
         if total == 0 {
             return 0;
         }
-        let top = self.viewport_top_row();
-        let last = if body == 0 {
-            top
-        } else {
-            top.saturating_add(WrappedRow(body - 1))
-        };
-        let max_index = WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX);
-        let last = cmp::min(last, max_index);
+        let layout = self.view_layout();
+        let start = cmp::min(layout.content_start.as_usize(), total);
+        let end = cmp::min(start.saturating_add(layout.content_rows as usize), total);
+        if end == 0 {
+            return line_at_visual_row(self.lines.row_counts(), layout.content_start);
+        }
+        let last = WrappedRow::try_from(end - 1).unwrap_or(WrappedRow::MAX);
         line_at_visual_row(self.lines.row_counts(), last)
     }
 
@@ -262,19 +271,10 @@ impl Renderer {
             return self.paint_status(out, &ruler);
         }
         let terminal_width = size.width;
-        let body_height = content_height(size.height);
         let total = self.lines.total();
-        let top = cmp::min(
-            wrapped_row_of_pos_at(
-                self.lines.lines(),
-                self.lines.width(),
-                self.lines.row_counts(),
-                self.pos,
-            ),
-            max_row(total, body_height),
-        );
-        let start = cmp::min(top.as_usize(), total);
-        let end = cmp::min(start.saturating_add(body_height as usize), total);
+        let layout = self.view_layout();
+        let start = cmp::min(layout.content_start.as_usize(), total);
+        let end = cmp::min(start.saturating_add(layout.content_rows as usize), total);
         let ruler = viewport_ruler(start, end, total);
         let ruler_cols = display_width(&ruler).0.min(size.width.0);
         // Keep one column between the label and the ruler when both fit.
@@ -283,13 +283,7 @@ impl Renderer {
         } else {
             size.width.0.saturating_sub(ruler_cols).saturating_sub(1)
         };
-        let visible = visual_rows_in_range(
-            &self.lines,
-            self.highlight.as_ref(),
-            self.terminal_bg,
-            WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX),
-            WrappedRow::try_from(end).unwrap_or(WrappedRow::MAX),
-        );
+        let visible = self.visible_rows(&layout, start, end);
         let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
         // Cursor only for an editable prompt (`/?`), which sets a caret.
         let show_cursor = self.status_caret.is_some();
@@ -389,21 +383,11 @@ impl Renderer {
     }
 
     fn viewport_top_row(&self) -> WrappedRow {
-        viewport_top_row_at(
-            self.lines.lines(),
-            self.lines.width(),
-            self.lines.row_counts(),
-            self.lines.total(),
-            self.pos,
-            self.size,
-        )
+        self.view_layout().content_start
     }
 
     fn set_top_row(&mut self, row: WrappedRow) {
-        let row = cmp::min(
-            row,
-            max_row(self.lines.total(), content_height(self.size.height)),
-        );
+        let row = self.clamp_top_row(row);
         self.pos = pos_of_wrapped_row_at(
             self.lines.lines(),
             self.lines.width(),
@@ -411,6 +395,175 @@ impl Renderer {
             self.lines.total(),
             row,
         );
+    }
+
+    /// Content window and optional pinned file header for the current
+    /// scroll position.
+    fn view_layout(&self) -> ViewLayout {
+        let content_start = self.clamp_top_row(wrapped_row_of_pos_at(
+            self.lines.lines(),
+            self.lines.width(),
+            self.lines.row_counts(),
+            self.pos,
+        ));
+        let body = content_height(self.size.height);
+        let pin_rows = self.pin_visual_rows_for_content_row(content_start);
+        let pin_header = if pin_rows == 0 {
+            None
+        } else {
+            self.file_header_at_row(content_start)
+        };
+        ViewLayout {
+            content_start,
+            content_rows: content_capacity(body, pin_rows),
+            pin_rows,
+            pin_header,
+        }
+    }
+
+    fn clamp_top_row(&self, desired: WrappedRow) -> WrappedRow {
+        cmp::min(desired, self.bottom_top_row())
+    }
+
+    /// Largest content-start row that still shows the last buffer row.
+    ///
+    /// A pinned header shrinks the content area, so this can be further
+    /// down than `total - body_height`. When the tail is shorter than
+    /// that shrunken area, the start is the first body row of the last
+    /// file: its header pins and its whole body stays on screen.
+    fn bottom_top_row(&self) -> WrappedRow {
+        let total = self.lines.total();
+        let body = content_height(self.size.height);
+        if total == 0 || body == 0 {
+            return WrappedRow(0);
+        }
+        // One screenful holds every row. Top stays at 0 so the header,
+        // if any, is in flow rather than pinned over a gap.
+        if total <= body as usize {
+            return WrappedRow(0);
+        }
+        let last = WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX);
+        let pin = self.pin_visual_rows_for_content_row(last);
+        if pin == 0 {
+            return max_row(total, body);
+        }
+        let capacity = cmp::max(content_capacity(body, pin), 1);
+        let filled = max_row(total, capacity);
+        if self.pin_visual_rows_for_content_row(filled) == pin {
+            return filled;
+        }
+        // The full pinned window would start above this file's body
+        // (the body is shorter than the content area). Keep the pin on
+        // this file and show all of its body.
+        match self.file_header_at_row(last) {
+            Some(header) => {
+                let end = self.header_end_row(header);
+                if end.as_usize() >= total {
+                    return max_row(total, body);
+                }
+                end
+            }
+            None => max_row(total, body),
+        }
+    }
+
+    fn header_end_row(&self, header: FileHeader) -> WrappedRow {
+        let row_counts = self.lines.row_counts();
+        if header.end >= row_counts.len() {
+            WrappedRow::try_from(self.lines.total()).unwrap_or(WrappedRow::MAX)
+        } else {
+            visual_row_of_line(row_counts, header.end)
+        }
+    }
+
+    /// Visual rows to pin when the content window starts at `content_row`.
+    /// Zero when that row still shows the file header in flow, or when
+    /// the row is not inside a diff file.
+    fn pin_visual_rows_for_content_row(&self, content_row: WrappedRow) -> u32 {
+        let body = content_height(self.size.height);
+        let total = self.lines.total();
+        if body <= 1 || total == 0 || self.file_headers.is_empty() {
+            return 0;
+        }
+        let row = cmp::min(
+            content_row,
+            WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX),
+        );
+        let Some(header) = self.file_header_at_row(row) else {
+            return 0;
+        };
+        let row_counts = self.lines.row_counts();
+        let header_start_row = visual_row_of_line(row_counts, header.start);
+        let header_end_row = self.header_end_row(header);
+        if row < header_end_row {
+            return 0;
+        }
+        let header_rows = header_end_row.saturating_sub(header_start_row).0;
+        pin_row_budget(header_rows, body)
+    }
+
+    fn file_header_at_row(&self, content_row: WrappedRow) -> Option<FileHeader> {
+        let total = self.lines.total();
+        if total == 0 || self.file_headers.is_empty() {
+            return None;
+        }
+        let row = cmp::min(
+            content_row,
+            WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX),
+        );
+        let line = line_at_visual_row(self.lines.row_counts(), row);
+        let index = file_header_index(&self.file_headers, line)?;
+        Some(self.file_headers[index])
+    }
+
+    fn row_visible(&self, row: WrappedRow) -> bool {
+        let layout = self.view_layout();
+        if layout.pin_rows > 0 {
+            if let Some(header) = layout.pin_header {
+                let start = visual_row_of_line(self.lines.row_counts(), header.start);
+                let end = start.saturating_add(WrappedRow(layout.pin_rows));
+                if row >= start && row < end {
+                    return true;
+                }
+            }
+        }
+        let content_end = layout
+            .content_start
+            .saturating_add(WrappedRow(layout.content_rows));
+        row >= layout.content_start && row < content_end
+    }
+
+    fn visible_rows(&self, layout: &ViewLayout, start: usize, end: usize) -> Vec<VisualRow> {
+        let mut rows = Vec::new();
+        if layout.pin_rows > 0 {
+            if let Some(header) = layout.pin_header {
+                let header_start = visual_row_of_line(self.lines.row_counts(), header.start);
+                let header_end = header_start.saturating_add(WrappedRow(layout.pin_rows));
+                rows = visual_rows_in_range(
+                    &self.lines,
+                    self.highlight.as_ref(),
+                    self.terminal_bg,
+                    header_start,
+                    header_end,
+                );
+            }
+        }
+        let mut content = visual_rows_in_range(
+            &self.lines,
+            self.highlight.as_ref(),
+            self.terminal_bg,
+            WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX),
+            WrappedRow::try_from(end).unwrap_or(WrappedRow::MAX),
+        );
+        // The first content row may be a wrap continuation. It must not
+        // glue onto the pinned header.
+        if !rows.is_empty() {
+            if let Some(first) = content.first_mut() {
+                first.soft_wrap = false;
+            }
+        }
+        rows.extend(content);
+        rows
     }
 
     fn clamp_pos_to_lines(&mut self) {
@@ -439,6 +592,31 @@ fn max_row(visual_row_count: usize, body_height: u32) -> WrappedRow {
     }
     let visual_row_count = WrappedRow::try_from(visual_row_count).unwrap_or(WrappedRow::MAX);
     visual_row_count.saturating_sub(WrappedRow(body_height))
+}
+
+/// Content rows left in the body after a pinned header of `pin_rows`.
+fn content_capacity(body_height: u32, pin_rows: u32) -> u32 {
+    body_height.saturating_sub(pin_rows)
+}
+
+/// How many of a header's visual rows may be pinned. At least one body
+/// row is kept for content when the body has more than one row.
+fn pin_row_budget(header_rows: u32, body_height: u32) -> u32 {
+    if body_height <= 1 || header_rows == 0 {
+        return 0;
+    }
+    cmp::min(header_rows, body_height - 1)
+}
+
+/// Where the viewport's content rows start, and which file header (if
+/// any) is pinned above them.
+struct ViewLayout {
+    content_start: WrappedRow,
+    /// Capacity of the content area, in wrapped rows. The drawn slice
+    /// may be shorter at the end of the buffer.
+    content_rows: u32,
+    pin_rows: u32,
+    pin_header: Option<FileHeader>,
 }
 
 struct VisualRow {
@@ -611,18 +789,6 @@ fn line_byte_len(line: &Line) -> usize {
         n += span.content.as_ref().len();
     }
     n
-}
-
-fn viewport_top_row_at(
-    lines: &[Line],
-    width: Width,
-    row_counts: &[WrappedRow],
-    total: usize,
-    pos: LinePos,
-    size: Size,
-) -> WrappedRow {
-    let row = wrapped_row_of_pos_at(lines, width, row_counts, pos);
-    cmp::min(row, max_row(total, content_height(size.height)))
 }
 
 fn wrapped_row_of_pos_at(
@@ -1396,5 +1562,162 @@ mod tests {
         renderer.set_lines(parse_command_output(b"a\nb\n"));
         renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
+    }
+
+    // Two files. Each header is diff/---/+++ (3 rows); the @@ line is body.
+    const TWO_FILES: &[u8] = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1,6 +1,6 @@
+one
+two
+three
+four
+five
+six
+diff --git a/bar b/bar
+--- a/bar
++++ b/bar
+@@ -1,2 +1,2 @@
+uno
+dos
+";
+
+    #[test]
+    fn test_file_header_not_pinned_at_top() {
+        // Height 8 → 7 body rows. The first screen is the foo header in flow.
+        let parser = draw_screen(TWO_FILES, 40, 8, 0);
+        assert_eq!("diff --git a/foo b/foo", row_text(&parser, 0, 40));
+        assert_eq!("--- a/foo", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/foo", row_text(&parser, 2, 40));
+        assert_eq!("@@ -1,6 +1,6 @@", row_text(&parser, 3, 40));
+        assert_eq!("one", row_text(&parser, 4, 40));
+        assert_eq!("two", row_text(&parser, 5, 40));
+        assert_eq!("three", row_text(&parser, 6, 40));
+    }
+
+    #[test]
+    fn test_file_header_stays_on_top_after_scroll() {
+        // Content starts at "one", past the header. The foo header is
+        // pinned above the body and is not left behind.
+        let parser = draw_screen(TWO_FILES, 40, 8, 4);
+        assert_eq!("diff --git a/foo b/foo", row_text(&parser, 0, 40));
+        assert_eq!("--- a/foo", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/foo", row_text(&parser, 2, 40));
+        assert_eq!("one", row_text(&parser, 3, 40));
+        assert_eq!("two", row_text(&parser, 4, 40));
+        assert_eq!("three", row_text(&parser, 5, 40));
+        assert_eq!("four", row_text(&parser, 6, 40));
+    }
+
+    #[test]
+    fn test_partial_header_is_not_duplicated() {
+        // Scrolled to the middle of the foo header: show it in flow only.
+        let parser = draw_screen(TWO_FILES, 40, 8, 1);
+        assert_eq!("--- a/foo", row_text(&parser, 0, 40));
+        assert_eq!("+++ b/foo", row_text(&parser, 1, 40));
+        assert_eq!("@@ -1,6 +1,6 @@", row_text(&parser, 2, 40));
+        // The `diff --git` line has scrolled off and must not be pinned
+        // back while the rest of the header is still in flow.
+        assert_eq!(
+            false,
+            parser.screen().contents().contains("diff --git a/foo")
+        );
+    }
+
+    #[test]
+    fn test_pinned_header_switches_to_current_file() {
+        // Row 10 is bar's `diff --git` line. It is on screen in flow.
+        let parser = draw_screen(TWO_FILES, 40, 8, 10);
+        assert_eq!("diff --git a/bar b/bar", row_text(&parser, 0, 40));
+        assert_eq!("--- a/bar", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/bar", row_text(&parser, 2, 40));
+        // Scroll through bar's header into its body: bar's header pins.
+        let parser = draw_screen(TWO_FILES, 40, 8, 13);
+        assert_eq!("diff --git a/bar b/bar", row_text(&parser, 0, 40));
+        assert_eq!("--- a/bar", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/bar", row_text(&parser, 2, 40));
+        assert_eq!("@@ -1,2 +1,2 @@", row_text(&parser, 3, 40));
+        assert_eq!("uno", row_text(&parser, 4, 40));
+        assert_eq!("dos", row_text(&parser, 5, 40));
+        assert_eq!(false, row_text(&parser, 0, 40).contains("a/foo"));
+    }
+
+    #[test]
+    fn test_scroll_bottom_keeps_last_line_and_file_header() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        renderer.set_lines(parse_command_output(TWO_FILES));
+        renderer.scroll_bottom();
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(8, 40);
+        parser.process(&buf);
+        assert_eq!("diff --git a/bar b/bar", row_text(&parser, 0, 40));
+        assert_eq!("--- a/bar", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/bar", row_text(&parser, 2, 40));
+        assert_eq!("@@ -1,2 +1,2 @@", row_text(&parser, 3, 40));
+        assert_eq!("uno", row_text(&parser, 4, 40));
+        assert_eq!("dos", row_text(&parser, 5, 40));
+        assert_eq!(true, row_text(&parser, 7, 40).ends_with("Bot"));
+    }
+
+    #[test]
+    fn test_scroll_bottom_long_file_shows_last_lines_under_header() {
+        // Body longer than the pinned content area, so the last page is
+        // a full content window under the pin and must include "last".
+        let mut text =
+            String::from("diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1,20 +1,20 @@\n");
+        for i in 0..20 {
+            text.push_str(&format!("line{i}\n"));
+        }
+        text.push_str("last\n");
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        renderer.set_lines(parse_command_output(text.as_bytes()));
+        renderer.scroll_bottom();
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(8, 40);
+        parser.process(&buf);
+        assert_eq!("diff --git a/foo b/foo", row_text(&parser, 0, 40));
+        assert_eq!("--- a/foo", row_text(&parser, 1, 40));
+        assert_eq!("+++ b/foo", row_text(&parser, 2, 40));
+        // Pin 3, content capacity 4. Last content row is "last".
+        assert_eq!("last", row_text(&parser, 6, 40));
+        assert_eq!(true, row_text(&parser, 7, 40).ends_with("Bot"));
+    }
+
+    #[test]
+    fn test_pinned_header_keeps_style() {
+        let input = b"\
+\x1b[1mdiff --git a/foo b/foo\x1b[0m
+--- a/foo
++++ b/foo
+@@ -1,5 +1,5 @@
+one
+two
+three
+four
+five
+";
+        let parser = draw_screen(input, 40, 8, 4);
+        assert_eq!("diff --git a/foo b/foo", row_text(&parser, 0, 40));
+        assert_eq!("one", row_text(&parser, 3, 40));
+        let cell = parser.screen().cell(0, 0).unwrap();
+        assert_eq!(true, cell.bold());
+    }
+
+    #[test]
+    fn test_non_diff_scroll_bottom_unchanged() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        renderer.set_lines(parse_command_output(b"a\nb\nc\nd\ne\nf\n"));
+        renderer.scroll_bottom();
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(3, 10);
+        parser.process(&buf);
+        assert_eq!("e", row_text(&parser, 0, 10));
+        assert_eq!("f", row_text(&parser, 1, 10));
+        assert_eq!("       Bot", row_text(&parser, 2, 10));
     }
 }

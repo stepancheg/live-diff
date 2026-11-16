@@ -1,6 +1,7 @@
 mod abort_on_drop_handle;
 mod capture;
 mod debug_or_test;
+mod diff;
 mod event_loop;
 mod height;
 mod help;
@@ -43,7 +44,7 @@ use crate::terminal_guard::restore_terminal;
 #[derive(clap::Parser, Debug)]
 struct Args {
     /// Seconds between command runs.
-    #[clap(short = 'n', long, env = "LIVE_DIFF_INTERVAL", default_value = "2")]
+    #[clap(short = 'n', long, env = "LIVE_DIFF_INTERVAL", default_value = "0.5")]
     interval: IntervalArg,
 
     /// Command to run. Defaults to `sl diff -r prev`.
