@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::abort_on_drop_handle::AbortOnDropHandle;
 use crate::diff::DiffOutput;
+use crate::diff::file_list_lines;
 use crate::height::Height;
 use crate::help::help_lines;
 use crate::mark::MarkOp;
@@ -50,6 +51,8 @@ enum KeyResult {
 enum Mode {
     Output,
     Help,
+    /// File list: one row per diff file. Enter jumps to that file.
+    Files,
     Prompt(Prompt),
     /// Waiting for the option letter after `-`.
     Dash,
@@ -68,6 +71,10 @@ pub(crate) struct EventLoop {
     size: Size,
     /// Unified diff context (`-U`). The capture loop reads this each run.
     context: Arc<AtomicU32>,
+    /// Latest snapshot, kept so the file-list mode can list paths and stats.
+    output: DiffOutput,
+    /// Selected row in the file list.
+    file_list_index: usize,
 }
 
 impl EventLoop {
@@ -86,6 +93,8 @@ impl EventLoop {
             mode: Mode::Output,
             size,
             context,
+            output: DiffOutput::message(""),
+            file_list_index: 0,
         }
     }
 
@@ -162,10 +171,13 @@ impl EventLoop {
         };
         self.renderer.update_size(self.size);
         self.help_renderer.update_size(self.size);
-        if matches!(self.mode, Mode::Help) {
-            self.help_renderer.redraw(&mut io::stdout())?;
-        } else {
-            self.renderer.redraw(&mut io::stdout())?;
+        match self.mode {
+            Mode::Help | Mode::Files => {
+                self.help_renderer.redraw(&mut io::stdout())?;
+            }
+            _ => {
+                self.renderer.redraw(&mut io::stdout())?;
+            }
         }
         Ok(())
     }
@@ -177,6 +189,8 @@ impl EventLoop {
 
     fn on_command_output(&mut self, output: DiffOutput) -> anyhow::Result<()> {
         let anchor = self.search.anchor(self.renderer.lines());
+        self.retain_file_list_selection(&output);
+        self.output = output.clone();
         self.renderer.set_diff(output);
         self.search.reattach(self.renderer.lines(), anchor);
         self.search.apply_highlight(&mut self.renderer);
@@ -187,8 +201,10 @@ impl EventLoop {
             );
             self.renderer.set_status_label(label);
         }
-        if !matches!(self.mode, Mode::Help) {
-            self.renderer.draw(&mut io::stdout())?;
+        match self.mode {
+            Mode::Help => {}
+            Mode::Files => self.draw_file_list()?,
+            _ => self.renderer.draw(&mut io::stdout())?,
         }
         Ok(())
     }
@@ -205,6 +221,7 @@ impl EventLoop {
                 self.on_mark_key(key, op)
             }
             Mode::Help => self.on_help_key(key),
+            Mode::Files => self.on_files_key(key),
             Mode::Output => self.on_output_key(key),
         }
     }
@@ -360,6 +377,173 @@ impl EventLoop {
         Ok(KeyResult::Continue)
     }
 
+    fn open_file_list(&mut self) -> anyhow::Result<KeyResult> {
+        let n = self.output.files().len();
+        self.file_list_index = match self.renderer.current_file_index() {
+            Some(i) if i < n => i,
+            _ => 0,
+        };
+        self.mode = Mode::Files;
+        // Start with the current file at the top of the list.
+        self.help_renderer.scroll_top();
+        self.draw_file_list()?;
+        self.help_renderer.scroll_to_line(self.file_list_index);
+        self.help_renderer.redraw(&mut io::stdout())?;
+        Ok(KeyResult::Continue)
+    }
+
+    fn close_file_list(&mut self) -> anyhow::Result<KeyResult> {
+        self.mode = Mode::Output;
+        self.renderer.redraw(&mut io::stdout())?;
+        Ok(KeyResult::Continue)
+    }
+
+    fn open_selected_file(&mut self) -> anyhow::Result<KeyResult> {
+        let n = self.output.files().len();
+        if n > 0 {
+            let index = self.file_list_index.min(n - 1);
+            self.renderer.scroll_to_file(index);
+            self.search.clear_match();
+            self.search.apply_highlight(&mut self.renderer);
+            self.renderer.set_status_label(None);
+        }
+        self.mode = Mode::Output;
+        self.renderer.redraw(&mut io::stdout())?;
+        Ok(KeyResult::Continue)
+    }
+
+    fn draw_file_list(&mut self) -> anyhow::Result<()> {
+        let files = self.output.files();
+        let n = files.len();
+        if n == 0 {
+            self.file_list_index = 0;
+        } else if self.file_list_index >= n {
+            self.file_list_index = n - 1;
+        }
+        let lines = file_list_lines(&files, self.file_list_index);
+        self.help_renderer.set_lines(lines);
+        self.help_renderer
+            .set_status_label(Some(String::from("Enter: go to file")));
+        self.help_renderer.ensure_line_visible(self.file_list_index);
+        self.help_renderer.redraw(&mut io::stdout())?;
+        Ok(())
+    }
+
+    fn retain_file_list_selection(&mut self, output: &DiffOutput) {
+        let old_labels: Vec<String> = self
+            .output
+            .files()
+            .iter()
+            .map(|file| crate::diff::file_header_text(file))
+            .collect();
+        let selected = old_labels.get(self.file_list_index).cloned();
+        let new_labels: Vec<String> = output
+            .files()
+            .iter()
+            .map(|file| crate::diff::file_header_text(file))
+            .collect();
+        if let Some(label) = selected {
+            if let Some(i) = new_labels.iter().position(|l| *l == label) {
+                self.file_list_index = i;
+                return;
+            }
+        }
+        if new_labels.is_empty() {
+            self.file_list_index = 0;
+        } else if self.file_list_index >= new_labels.len() {
+            self.file_list_index = new_labels.len() - 1;
+        }
+    }
+
+    fn move_file_selection(&mut self, target: usize) -> anyhow::Result<()> {
+        let n = self.output.files().len();
+        if n == 0 {
+            self.file_list_index = 0;
+        } else {
+            self.file_list_index = target.min(n - 1);
+        }
+        self.draw_file_list()
+    }
+
+    fn on_files_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(KeyResult::Continue);
+        }
+        // Enter opens the file. key_action maps Enter to ScrollDown, so
+        // handle it before that table.
+        if key.code == KeyCode::Enter {
+            return self.open_selected_file();
+        }
+        let Some(action) = key_action(&key) else {
+            return Ok(KeyResult::Continue);
+        };
+        let n = self.output.files().len();
+        let page = list_page_size(self.size);
+        match action {
+            KeyAction::Quit | KeyAction::FileList | KeyAction::DismissMessage => {
+                self.close_file_list()
+            }
+            KeyAction::Help => {
+                // Leave the list and show help.
+                self.mode = Mode::Help;
+                self.help_renderer.set_lines(help_lines());
+                self.help_renderer.set_status_label(None);
+                self.help_renderer.scroll_top();
+                self.help_renderer.redraw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::Refresh => Ok(KeyResult::Refresh),
+            KeyAction::ContextLess | KeyAction::ContextMore => {
+                // Apply on the diff underneath; stay in the list. The
+                // next snapshot redraws the list.
+                let result = self.change_context(action)?;
+                self.mode = Mode::Files;
+                // change_context redrew the diff. Paint the list back.
+                self.draw_file_list()?;
+                Ok(result)
+            }
+            KeyAction::ScrollDown => {
+                let next = self.file_list_index.saturating_add(1);
+                self.move_file_selection(next)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollUp => {
+                let prev = self.file_list_index.saturating_sub(1);
+                self.move_file_selection(prev)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollTop => {
+                self.move_file_selection(0)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollBottom => {
+                self.move_file_selection(n.saturating_sub(1))?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollPageDown => {
+                let next = self.file_list_index.saturating_add(page);
+                self.move_file_selection(next)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollPageUp => {
+                let prev = self.file_list_index.saturating_sub(page);
+                self.move_file_selection(prev)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::Redraw => {
+                self.help_renderer.redraw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::Dash
+            | KeyAction::SearchForward
+            | KeyAction::SearchBackward
+            | KeyAction::SearchNext
+            | KeyAction::SearchPrev
+            | KeyAction::SetMark
+            | KeyAction::GotoMark => Ok(KeyResult::Continue),
+        }
+    }
+
     fn change_context(&mut self, action: KeyAction) -> anyhow::Result<KeyResult> {
         let increase = matches!(action, KeyAction::ContextMore);
         let current = self.context.load(Ordering::SeqCst);
@@ -400,6 +584,7 @@ impl EventLoop {
                 self.mode = Mode::Output;
                 self.change_context(action)
             }
+            KeyAction::FileList => Ok(KeyResult::Continue),
             KeyAction::Dash => Ok(KeyResult::Continue),
             KeyAction::SearchForward
             | KeyAction::SearchBackward
@@ -453,6 +638,7 @@ impl EventLoop {
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::ContextLess | KeyAction::ContextMore => self.change_context(action),
+            KeyAction::FileList => self.open_file_list(),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
@@ -559,6 +745,7 @@ fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<(
         | KeyAction::Refresh
         | KeyAction::ContextLess
         | KeyAction::ContextMore
+        | KeyAction::FileList
         | KeyAction::SearchForward
         | KeyAction::SearchBackward
         | KeyAction::SearchNext
@@ -591,6 +778,12 @@ enum KeyAction {
     GotoMark,
     ContextLess,
     ContextMore,
+    FileList,
+}
+
+fn list_page_size(size: Size) -> usize {
+    let rows = size.height.0.saturating_sub(1).max(1);
+    usize::try_from(rows).unwrap_or(1)
 }
 
 fn is_dismissable_status(status: &str) -> bool {
@@ -632,6 +825,12 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('G') | KeyCode::End => Some(KeyAction::ScrollBottom),
         KeyCode::Char(' ') | KeyCode::PageDown => Some(KeyAction::ScrollPageDown),
         KeyCode::PageUp => Some(KeyAction::ScrollPageUp),
+        KeyCode::Char('f')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(KeyAction::FileList)
+        }
         KeyCode::Char('u')
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>

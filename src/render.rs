@@ -158,12 +158,11 @@ impl Renderer {
     }
 
     pub(crate) fn scroll_down(&mut self) {
+        // One document row, including file headers. A header is its own
+        // stop so crossing into the next file shifts the view by one
+        // line. A header with no hunks stays visible.
         let top = self.viewport_top_row();
-        // Step to the next body row. Header rows are not scroll stops:
-        // they are drawn only as the pin, so moving onto one would not
-        // shift the body and would drop a line at the bottom.
-        let next = self.step_content_row(top, 1);
-        self.set_top_row(next);
+        self.set_top_row(top.saturating_add(WrappedRow(1)));
     }
 
     pub(crate) fn scroll_up(&mut self) {
@@ -171,8 +170,7 @@ impl Renderer {
         if top == WrappedRow(0) {
             return;
         }
-        let prev = self.step_content_row_back(top);
-        self.set_top_row(prev);
+        self.set_top_row(top.saturating_sub(WrappedRow(1)));
     }
 
     pub(crate) fn scroll_top(&mut self) {
@@ -185,22 +183,16 @@ impl Renderer {
 
     pub(crate) fn scroll_page_down(&mut self) {
         let layout = self.view_layout();
+        // Each content slot is one document row. A pinned header's own
+        // row stays in the slice as a blank, so a page is `content_rows`.
         let step = cmp::max(layout.content_rows, 1);
-        let next = self.step_content_row(layout.content_start, step);
-        self.set_top_row(next);
+        self.set_top_row(layout.content_start.saturating_add(WrappedRow(step)));
     }
 
     pub(crate) fn scroll_page_up(&mut self) {
         let layout = self.view_layout();
         let step = cmp::max(layout.content_rows, 1);
-        let mut row = layout.content_start;
-        for _ in 0..step {
-            if row == WrappedRow(0) {
-                break;
-            }
-            row = self.step_content_row_back(row);
-        }
-        self.set_top_row(row);
+        self.set_top_row(layout.content_start.saturating_sub(WrappedRow(step)));
     }
 
     pub(crate) fn scroll_to_pos(&mut self, pos: LinePos) {
@@ -210,9 +202,60 @@ impl Renderer {
         self.set_top_row(top);
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn scroll_to_line(&mut self, line_idx: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let line_idx = line_idx.min(self.lines.len().saturating_sub(1));
         self.set_top_row(visual_row_of_line(self.lines.row_counts(), line_idx));
+    }
+
+    /// Scroll the diff so file `index` (into the header list) is at the
+    /// top. The path header is pinned and its hunks follow. A file with
+    /// no hunks lands on the header itself.
+    pub(crate) fn scroll_to_file(&mut self, index: usize) {
+        let Some(header) = self.file_headers.get(index).copied() else {
+            return;
+        };
+        let body = self.header_end_row(header);
+        if body.as_usize() < self.lines.total() {
+            let line = line_at_visual_row(self.lines.row_counts(), body);
+            if file_header_index(&self.file_headers, line) == Some(index)
+                && !self.row_is_in_header(body)
+            {
+                self.set_top_row(body);
+                return;
+            }
+        }
+        self.scroll_to_line(header.start);
+    }
+
+    /// Index of the file whose body is at the top of the viewport.
+    pub(crate) fn current_file_index(&self) -> Option<usize> {
+        if self.file_headers.is_empty() || self.lines.is_empty() {
+            return None;
+        }
+        file_header_index(&self.file_headers, self.top_line_index())
+    }
+
+    /// Scroll the minimum amount so `line_idx` is inside the viewport.
+    pub(crate) fn ensure_line_visible(&mut self, line_idx: usize) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let line_idx = line_idx.min(self.lines.len().saturating_sub(1));
+        let top = self.top_line_index();
+        let bottom = self.bottom_line_index();
+        if line_idx < top {
+            self.scroll_to_line(line_idx);
+            return;
+        }
+        if line_idx > bottom {
+            let body = content_height(self.size.height);
+            let target = visual_row_of_line(self.lines.row_counts(), line_idx);
+            let back = WrappedRow(body.saturating_sub(1));
+            self.set_top_row(target.saturating_sub(back));
+        }
     }
 
     pub(crate) fn scroll_to_match(&mut self, line_idx: usize, byte_start: usize) {
@@ -436,9 +479,10 @@ impl Renderer {
     /// scroll position.
     ///
     /// The file header is pinned for the whole time that file is on
-    /// screen, including at the top of the file. Header rows are not
-    /// part of the content window, so a one-line scroll shifts the body
-    /// by one line.
+    /// screen. Header rows are scroll stops. Landing on a header keeps
+    /// the *previous* file pinned (that file may then have zero diff
+    /// lines on screen) and draws this header in flow, so the two
+    /// paths stack and the view shifts by one line.
     fn view_layout(&self) -> ViewLayout {
         let raw = wrapped_row_of_pos_at(
             self.lines.lines(),
@@ -446,9 +490,9 @@ impl Renderer {
             self.lines.row_counts(),
             self.pos,
         );
-        let content_start = self.clamp_top_row(self.skip_header_rows(raw));
+        let content_start = self.clamp_top_row(raw);
         let body = content_height(self.size.height);
-        let pin_header = self.file_header_at_row(content_start);
+        let pin_header = self.pin_header_for_content_start(content_start);
         let pin_rows = match pin_header {
             Some(header) => self.pin_visual_rows_for_header(header),
             None => 0,
@@ -463,124 +507,72 @@ impl Renderer {
     }
 
     fn clamp_top_row(&self, desired: WrappedRow) -> WrappedRow {
-        let row = cmp::min(desired, self.bottom_top_row());
-        // bottom_top_row is a body row. If desired was a header, the
-        // caller has usually already skipped it; skip again in case
-        // the clamp landed on one.
-        let skipped = self.skip_header_rows(row);
-        if skipped.as_usize() >= self.lines.total() {
-            return row;
-        }
-        // Skipping forward can pass the bottom; don't scroll past it.
-        let bottom = self.bottom_top_row();
-        if skipped > bottom { bottom } else { skipped }
+        let min = self.min_top_row();
+        let max = self.bottom_top_row();
+        let max = cmp::max(max, min);
+        cmp::min(cmp::max(desired, min), max)
     }
 
-    /// Largest content-start row that still shows the last body row.
+    /// First scroll stop. A leading file header that has a body is not
+    /// a stop, so the opening view is the pin plus hunks with no blank
+    /// slot. A leading header with no body is a stop, so that file is
+    /// still shown.
+    fn min_top_row(&self) -> WrappedRow {
+        let total = self.lines.total();
+        if total == 0 || !self.row_is_in_header(WrappedRow(0)) {
+            return WrappedRow(0);
+        }
+        let Some(header) = self.file_header_at_row(WrappedRow(0)) else {
+            return WrappedRow(0);
+        };
+        let body = self.header_end_row(header);
+        if body.as_usize() >= total || self.row_is_in_header(body) {
+            // No body lines in this file.
+            return WrappedRow(0);
+        }
+        let line = line_at_visual_row(self.lines.row_counts(), body);
+        if file_header_index(&self.file_headers, line) != Some(0) {
+            return WrappedRow(0);
+        }
+        body
+    }
+
+    /// Largest content-start row that still shows the last row.
     ///
-    /// Header rows are excluded from the window, and a pinned header
-    /// shrinks the content area, so this is the body row `capacity`
-    /// non-header rows before the end.
+    /// The content window is a flat slice of `capacity` document rows.
+    /// Pinned-header rows inside that slice are drawn blank but still
+    /// occupy their slot, so the window length is the flat distance.
     fn bottom_top_row(&self) -> WrappedRow {
         let total = self.lines.total();
         let body = content_height(self.size.height);
+        let min = self.min_top_row();
         if total == 0 || body == 0 {
-            return WrappedRow(0);
+            return min;
         }
         let last = WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX);
         let pin = self.pin_visual_rows_for_content_row(last);
-        let capacity = cmp::max(content_capacity(body, pin), 1);
-        let start = self.content_row_back(last, capacity - 1);
-        // Pin height at `start` may differ from the pin at `last`.
-        // Recompute once with that height.
+        let capacity = cmp::max(content_capacity(body, pin), 1) as usize;
+        let start = self.bottom_start_for_capacity(total, capacity, min);
         let pin_at_start = self.pin_visual_rows_for_content_row(start);
-        let capacity_at_start = cmp::max(content_capacity(body, pin_at_start), 1);
+        let capacity_at_start = cmp::max(content_capacity(body, pin_at_start), 1) as usize;
         if capacity_at_start == capacity {
             return start;
         }
-        self.content_row_back(last, capacity_at_start - 1)
+        self.bottom_start_for_capacity(total, capacity_at_start, min)
     }
 
-    /// The non-header row `steps` body rows before `from`, inclusive of
-    /// `from` when `from` is itself a body row and `steps` is 0.
-    /// `steps` counts only non-header rows. Stops at the first body row.
-    fn content_row_back(&self, from: WrappedRow, steps: u32) -> WrappedRow {
-        let total = self.lines.total();
-        if total == 0 {
-            return WrappedRow(0);
+    fn bottom_start_for_capacity(
+        &self,
+        total: usize,
+        capacity: usize,
+        min: WrappedRow,
+    ) -> WrappedRow {
+        let min_usize = min.as_usize();
+        if total.saturating_sub(min_usize) <= capacity {
+            return min;
         }
-        let mut row = cmp::min(
-            from,
-            WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX),
-        );
-        // If `from` is a header, start from the body row just above it.
-        if self.row_is_in_header(row) {
-            match self.step_content_row_back_from_header(row) {
-                Some(prev) => row = prev,
-                None => return WrappedRow(0),
-            }
-        }
-        for _ in 0..steps {
-            if row == WrappedRow(0) {
-                break;
-            }
-            row = self.step_content_row_back(row);
-        }
-        row
-    }
-
-    /// Next body row at or after `row`. Header rows are skipped.
-    fn skip_header_rows(&self, row: WrappedRow) -> WrappedRow {
-        let total = self.lines.total();
-        let mut row = row;
-        while row.as_usize() < total && self.row_is_in_header(row) {
-            let line = line_at_visual_row(self.lines.row_counts(), row);
-            // Skip the rest of this header span, not just the current line.
-            let end = match self
-                .file_headers
-                .iter()
-                .find(|h| line >= h.start && line < h.end)
-            {
-                Some(header) => self.header_end_row(*header),
-                None => row.saturating_add(WrappedRow(1)),
-            };
-            if end <= row {
-                // No progress (empty span); avoid a spin.
-                row = row.saturating_add(WrappedRow(1));
-            } else {
-                row = end;
-            }
-        }
-        row
-    }
-
-    /// Move forward by `steps` non-header rows from `start`.
-    /// `start` should already be a body row (or a preamble row).
-    fn step_content_row(&self, start: WrappedRow, steps: u32) -> WrappedRow {
-        let total = self.lines.total();
-        let mut row = start;
-        for _ in 0..steps {
-            if row.as_usize() + 1 >= total {
-                // Past the last row: stay, clamp will hold us.
-                return self.skip_header_rows(row.saturating_add(WrappedRow(1)));
-            }
-            row = row.saturating_add(WrappedRow(1));
-            row = self.skip_header_rows(row);
-            if row.as_usize() >= total {
-                return row;
-            }
-        }
-        row
-    }
-
-    /// Previous non-header row strictly before `start`.
-    /// `start` is a body row. If there is none, returns `start` when
-    /// `start` is already 0, otherwise the earliest row.
-    fn step_content_row_back(&self, start: WrappedRow) -> WrappedRow {
-        match self.step_content_row_back_from_header(start) {
-            Some(prev) => prev,
-            None => start,
-        }
+        let start = total - capacity;
+        cmp::max(WrappedRow::try_from(start).unwrap_or(WrappedRow::MAX), min)
     }
 
     fn step_content_row_back_from_header(&self, start: WrappedRow) -> Option<WrappedRow> {
@@ -623,7 +615,7 @@ impl Renderer {
     /// The header is pinned whenever that file is the one on screen,
     /// including when `content_row` still lies inside the header.
     fn pin_visual_rows_for_content_row(&self, content_row: WrappedRow) -> u32 {
-        match self.file_header_at_row(content_row) {
+        match self.pin_header_for_content_start(content_row) {
             Some(header) => self.pin_visual_rows_for_header(header),
             None => 0,
         }
@@ -665,28 +657,13 @@ impl Renderer {
                 }
             }
         }
-        if row < layout.content_start || self.row_is_in_header(row) {
-            return false;
-        }
-        // Visible body rows are the next `content_rows` non-header rows.
-        let mut cursor = layout.content_start;
-        let mut left = layout.content_rows;
-        let total = self.lines.total();
-        while left > 0 && cursor.as_usize() < total {
-            if self.row_is_in_header(cursor) {
-                cursor = self.skip_header_rows(cursor);
-                continue;
-            }
-            if cursor == row {
-                return true;
-            }
-            if cursor > row {
-                return false;
-            }
-            cursor = cursor.saturating_add(WrappedRow(1));
-            left = left.saturating_sub(1);
-        }
-        false
+        // Content is a flat slice. In-flow headers of files that start
+        // below the pin are part of that slice. The pinned header itself
+        // sits above content_start and was handled above.
+        let content_end = layout
+            .content_start
+            .saturating_add(WrappedRow(layout.content_rows));
+        row >= layout.content_start && row < content_end
     }
 
     fn visible_rows(&self, layout: &ViewLayout) -> Vec<VisualRow> {
@@ -704,7 +681,16 @@ impl Renderer {
                 );
             }
         }
-        let mut content = self.collect_content_rows(layout.content_start, layout.content_rows);
+        let content_end = layout
+            .content_start
+            .saturating_add(WrappedRow(layout.content_rows));
+        let mut content = visual_rows_in_range(
+            &self.lines,
+            self.highlight.as_ref(),
+            self.terminal_bg,
+            layout.content_start,
+            content_end,
+        );
         // The first content row may be a wrap continuation. It must not
         // glue onto the pinned header.
         if !rows.is_empty() {
@@ -716,71 +702,39 @@ impl Renderer {
         rows
     }
 
-    /// Flat visual-row cursor after taking `max_rows` non-header rows
-    /// from `start`. Used for the viewport ruler.
+    /// Flat visual-row cursor after taking `max_rows` rows from `start`.
+    /// In-flow file headers count as rows. Used for the viewport ruler.
     fn flat_end_after_content(&self, start: WrappedRow, max_rows: u32) -> usize {
         let total = self.lines.total();
-        let mut cursor = start;
-        let mut remaining = max_rows;
-        while remaining > 0 && cursor.as_usize() < total {
-            if self.row_is_in_header(cursor) {
-                cursor = self.skip_header_rows(cursor);
-                continue;
-            }
-            cursor = cursor.saturating_add(WrappedRow(1));
-            remaining = remaining.saturating_sub(1);
-        }
-        // If the window ran off the end of the buffer, report `total` so
-        // the ruler reads Bot.
-        if remaining > 0 {
-            total
-        } else {
-            cmp::min(cursor.as_usize(), total)
-        }
+        let end = start.as_usize().saturating_add(max_rows as usize);
+        // If the window runs off the end of the buffer, report `total`
+        // so the ruler reads Bot.
+        cmp::min(end, total)
     }
 
-    /// Up to `max_rows` non-header visual rows starting at `start`.
-    /// Header rows in the way are skipped so they are not drawn twice
-    /// (once in the pin, once in the body).
-    fn collect_content_rows(&self, start: WrappedRow, max_rows: u32) -> Vec<VisualRow> {
-        let mut rows = Vec::new();
-        if max_rows == 0 {
-            return rows;
-        }
+    /// Header to pin above a content window that starts at `content_start`.
+    ///
+    /// A body row pins its own file. A header row pins the previous
+    /// file, so this header is drawn in flow under that pin. With no
+    /// previous file there is no pin.
+    fn pin_header_for_content_start(&self, content_start: WrappedRow) -> Option<FileHeaderSpan> {
         let total = self.lines.total();
-        let mut cursor = start;
-        let mut remaining = max_rows;
-        while remaining > 0 && cursor.as_usize() < total {
-            if self.row_is_in_header(cursor) {
-                cursor = self.skip_header_rows(cursor);
-                continue;
-            }
-            let line = line_at_visual_row(self.lines.row_counts(), cursor);
-            let line_start = visual_row_of_line(self.lines.row_counts(), line);
-            let line_rows = self.lines.row_counts()[line];
-            let line_end = line_start.saturating_add(line_rows);
-            // Rows of this line from `cursor` to the end of the line,
-            // capped by `remaining`.
-            let available = line_end.saturating_sub(cursor);
-            let take = cmp::min(available, WrappedRow(remaining));
-            if take == WrappedRow(0) {
-                cursor = cursor.saturating_add(WrappedRow(1));
-                continue;
-            }
-            let part_end = cursor.saturating_add(take);
-            let part = visual_rows_in_range(
-                &self.lines,
-                self.highlight.as_ref(),
-                self.terminal_bg,
-                cursor,
-                part_end,
-            );
-            let took = u32::try_from(part.len()).unwrap_or(remaining);
-            remaining = remaining.saturating_sub(took);
-            rows.extend(part);
-            cursor = part_end;
+        if total == 0 || self.file_headers.is_empty() {
+            return None;
         }
-        rows
+        if content_start.as_usize() >= total {
+            return self
+                .file_header_at_row(WrappedRow::try_from(total - 1).unwrap_or(WrappedRow::MAX));
+        }
+        if self.row_is_in_header(content_start) {
+            let line = line_at_visual_row(self.lines.row_counts(), content_start);
+            let idx = file_header_index(&self.file_headers, line)?;
+            if idx == 0 {
+                return None;
+            }
+            return Some(self.file_headers[idx - 1]);
+        }
+        self.file_header_at_row(content_start)
     }
 
     fn clamp_pos_to_lines(&mut self) {
@@ -1839,13 +1793,75 @@ mod tests {
         input.push_str(&context_file_diff("bar", 20));
         // foo body is @@ + 20 lines = 21 rows. That many Downs lands on
         // the first body row of bar, with bar's path pinned.
+        // 21 Downs land on bar's header: foo is still pinned above it.
+        // 22 Downs reach bar's first hunk line and pin bar.
         let parser = draw_diff(input.as_bytes(), 40, 8, 21);
+        assert_eq!("foo", row_text(&parser, 0, 40));
+        assert_eq!("bar", row_text(&parser, 1, 40));
+        let parser = draw_diff(input.as_bytes(), 40, 8, 22);
         assert_eq!("bar", row_text(&parser, 0, 40));
         assert_eq!("@@ -1,20 +1,20 @@", row_text(&parser, 1, 40));
-        let parser = draw_diff(input.as_bytes(), 40, 8, 23);
+        let parser = draw_diff(input.as_bytes(), 40, 8, 24);
         assert_eq!("bar", row_text(&parser, 0, 40));
         assert_eq!(" line1", row_text(&parser, 1, 40));
         assert_eq!(false, row_text(&parser, 0, 40).contains("foo"));
+    }
+
+    #[test]
+    fn test_in_flow_header_kept_when_next_file_starts_mid_screen() {
+        // Height 8 → 7 body rows, pin 1, capacity 6.
+        // foo: header + @@ + 10 lines = 12 rows (indices 0..11).
+        // bar starts at index 12.
+        // 10 Downs from the first body row (index 1) lands on foo's
+        // last line (index 11). bar's path must appear where its hunks
+        // begin, under the pinned foo header.
+        let mut input = context_file_diff("foo", 10);
+        input.push_str(&context_file_diff("bar", 10));
+        let junction = draw_diff(input.as_bytes(), 40, 8, 10);
+        assert_eq!("foo", row_text(&junction, 0, 40));
+        assert_eq!(" line9", row_text(&junction, 1, 40));
+        assert_eq!("bar", row_text(&junction, 2, 40));
+        assert_eq!("@@ -1,10 +1,10 @@", row_text(&junction, 3, 40));
+        assert_eq!(" line0", row_text(&junction, 4, 40));
+        // One more Down lands on bar's header. foo stays pinned (zero
+        // of its hunks remain on screen) and bar's path is drawn in
+        // flow directly under that pin. @@ moves from row 3 to row 2.
+        let on_bar_header = draw_diff(input.as_bytes(), 40, 8, 11);
+        assert_eq!("foo", row_text(&on_bar_header, 0, 40));
+        assert_eq!("bar", row_text(&on_bar_header, 1, 40));
+        assert_eq!("@@ -1,10 +1,10 @@", row_text(&on_bar_header, 2, 40));
+        assert_eq!(" line0", row_text(&on_bar_header, 3, 40));
+        // The next Down pins bar and shows its hunks under the pin.
+        let on_bar = draw_diff(input.as_bytes(), 40, 8, 12);
+        assert_eq!("bar", row_text(&on_bar, 0, 40));
+        assert_eq!("@@ -1,10 +1,10 @@", row_text(&on_bar, 1, 40));
+        assert_eq!(" line0", row_text(&on_bar, 2, 40));
+    }
+
+    #[test]
+    fn test_header_with_no_hunks_is_a_scroll_stop() {
+        // A mode-only file has a header and no hunks. Down from the
+        // previous file must stop on that header rather than skipping it.
+        let mut input = context_file_diff("foo", 8);
+        input.push_str("diff --git a/mode b/mode\nold mode 100644\nnew mode 100755\n");
+        input.push_str(&context_file_diff("bar", 8));
+        // Projected rows: foo header+@@+8 = 10 (0..9), mode header
+        // alone at row 10, bar after that. min stop is row 1.
+        // 8 Downs reach foo's last line (row 9).
+        let junction = draw_diff(input.as_bytes(), 40, 8, 8);
+        assert_eq!("foo", row_text(&junction, 0, 40));
+        assert_eq!(" line7", row_text(&junction, 1, 40));
+        assert_eq!("mode", row_text(&junction, 2, 40));
+        let on_empty = draw_diff(input.as_bytes(), 40, 8, 9);
+        // foo stays pinned with zero hunks on screen; mode's path is
+        // the next line. One further Down pins mode (still no hunks)
+        // above bar.
+        assert_eq!("foo", row_text(&on_empty, 0, 40));
+        assert_eq!("mode", row_text(&on_empty, 1, 40));
+        assert_eq!("bar", row_text(&on_empty, 2, 40));
+        let on_mode_pin = draw_diff(input.as_bytes(), 40, 8, 10);
+        assert_eq!("mode", row_text(&on_mode_pin, 0, 40));
+        assert_eq!("bar", row_text(&on_mode_pin, 1, 40));
     }
 
     #[test]

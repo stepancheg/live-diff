@@ -90,7 +90,6 @@ impl DiffOutput {
         DiffOutput { segments }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn files(&self) -> Vec<&FileDiff> {
         let mut files = Vec::new();
         for segment in &self.segments {
@@ -161,6 +160,50 @@ pub(crate) fn parse_diff(input: &[u8]) -> DiffOutput {
         i += 1;
     }
     DiffOutput { segments }
+}
+
+impl FileDiff {
+    fn change_counts(&self) -> (u32, u32) {
+        let mut ins = 0u32;
+        let mut del = 0u32;
+        for hunk in &self.hunks {
+            for line in &hunk.lines {
+                match line.kind {
+                    HunkLineKind::Insert => ins = ins.saturating_add(1),
+                    HunkLineKind::Delete => del = del.saturating_add(1),
+                    HunkLineKind::Context | HunkLineKind::Note => {}
+                }
+            }
+        }
+        (ins, del)
+    }
+}
+
+/// One row per file for the file-list mode. `selected` is drawn with a
+/// reverse-video cursor.
+pub(crate) fn file_list_lines(files: &[&FileDiff], selected: usize) -> Vec<Line> {
+    if files.is_empty() {
+        return vec![Line::from_styled("(no files)", diff_note_style())];
+    }
+    let mut lines = Vec::with_capacity(files.len());
+    for (i, file) in files.iter().enumerate() {
+        let mut text = String::from(if i == selected { "> " } else { "  " });
+        text.push_str(&file_header_text(file));
+        if file.binary {
+            text.push_str("  binary");
+        } else {
+            let (ins, del) = file.change_counts();
+            if ins > 0 || del > 0 {
+                text.push_str(&format!("  +{ins} -{del}"));
+            }
+        }
+        let mut style = diff_file_header_style();
+        if i == selected {
+            style.reverse = true;
+        }
+        lines.push(Line::from_styled(&text, style));
+    }
+    lines
 }
 
 /// Index of the header span whose file section contains `line`.
@@ -748,7 +791,7 @@ fn strip_ab_prefix(path: &str) -> &str {
     }
 }
 
-fn file_header_text(file: &FileDiff) -> String {
+pub(crate) fn file_header_text(file: &FileDiff) -> String {
     match (&file.old, &file.new) {
         (Some(old), Some(new)) if old == new => old.clone(),
         (Some(old), Some(new)) => format!("{old} -> {new}"),
@@ -1280,6 +1323,33 @@ rename to new
         assert_eq!(Some(0), file_header_index(&headers, 9));
         assert_eq!(Some(1), file_header_index(&headers, 10));
         assert_eq!(Some(1), file_header_index(&headers, 40));
+    }
+
+    #[test]
+    fn test_file_list_lines_marks_selection_and_counts() {
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1,2 @@
+-old
++new
++extra
+diff --git a/bar b/bar
+--- a/bar
++++ b/bar
+@@ -1 +1 @@
+-a
++b
+";
+        let output = parse_diff(input);
+        let files = output.files();
+        let lines = crate::diff::file_list_lines(&files, 1);
+        assert_eq!(2, lines.len());
+        assert_eq!("  foo  +2 -1", lines[0].plain_text());
+        assert_eq!("> bar  +1 -1", lines[1].plain_text());
+        assert_eq!(true, lines[1].spans.iter().any(|s| s.style.reverse));
+        assert_eq!(false, lines[0].spans.iter().any(|s| s.style.reverse));
     }
 
     #[test]

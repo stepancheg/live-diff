@@ -19,6 +19,7 @@ Keys
   N              Repeat search in reverse
   mx             Mark current position as x
   'x             Go to mark x
+  f              File list
   u              Decrease context
   U              Increase context
   -i             Toggle ignore case
@@ -26,6 +27,7 @@ Keys
   ^l             Redraw
 
 q or h closes this page.
+In the file list, j/k move, Enter goes to the file, Esc or f or q returns.
 In the prompt, Enter searches. Up and Down recall previous searches.
 Esc cancels the prompt or clears Pattern not found.
 ";
@@ -68,7 +70,7 @@ mod tests {
         assert_eq!(true, text.contains("h              Show this help"));
         assert_eq!(
             true,
-            text.contains("r              Run the command now (kills the current run)")
+            text.contains("r              Run the diff command now")
         );
         assert_eq!(true, text.contains("q              Quit"));
         assert_eq!(true, text.contains("q or h closes this page."));
@@ -88,6 +90,7 @@ mod tests {
             text.contains("mx             Mark current position as x")
         );
         assert_eq!(true, text.contains("'x             Go to mark x"));
+        assert_eq!(true, text.contains("f              File list"));
         assert_eq!(true, text.contains("u              Decrease context"));
         assert_eq!(true, text.contains("U              Increase context"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));
