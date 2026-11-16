@@ -4,6 +4,13 @@ use std::path::Path;
 use anyhow::anyhow;
 use anyhow::bail;
 
+use crate::repo::git::git_commit_diff_command;
+use crate::repo::git::git_diff_command;
+use crate::repo::git::git_untracked_command;
+use crate::repo::sl::sl_commit_diff_command;
+use crate::repo::sl::sl_diff_command;
+use crate::repo::sl::sl_untracked_command;
+
 /// Diff command for the repository that contains `dir`.
 ///
 /// Sapling is used when the repository already has sl metadata (a `.sl`
@@ -18,7 +25,7 @@ pub(crate) const MAX_CONTEXT: u32 = 999;
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn diff_command_in(dir: &Path) -> anyhow::Result<Vec<String>> {
     let tool = diff_tool_in(dir)?;
-    Ok(command_for_tool(tool, DEFAULT_CONTEXT, None))
+    Ok(command_for_tool(tool, DEFAULT_CONTEXT, None, None))
 }
 
 pub(crate) fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
@@ -30,10 +37,21 @@ pub(crate) fn diff_tool() -> anyhow::Result<DiffTool> {
     diff_tool_in(&dir)
 }
 
-pub(crate) fn command_for_tool(tool: DiffTool, context: u32, rev: Option<&str>) -> Vec<String> {
-    match tool {
-        DiffTool::Sl => sl_diff_command(context, rev),
-        DiffTool::Git => git_diff_command(context, rev),
+pub(crate) fn command_for_tool(
+    tool: DiffTool,
+    context: u32,
+    rev: Option<&str>,
+    commit: Option<&str>,
+) -> Vec<String> {
+    match commit {
+        Some(commit) => match tool {
+            DiffTool::Sl => sl_commit_diff_command(context, commit),
+            DiffTool::Git => git_commit_diff_command(context, commit),
+        },
+        None => match tool {
+            DiffTool::Sl => sl_diff_command(context, rev),
+            DiffTool::Git => git_diff_command(context, rev),
+        },
     }
 }
 
@@ -41,22 +59,8 @@ pub(crate) fn command_for_tool(tool: DiffTool, context: u32, rev: Option<&str>) 
 /// relative to the repository root.
 pub(crate) fn untracked_command_for_tool(tool: DiffTool) -> Vec<String> {
     match tool {
-        DiffTool::Sl => vec![
-            String::from("sl"),
-            String::from("status"),
-            String::from("-u"),
-            String::from("-n"),
-            String::from("-0"),
-            String::from("--root-relative"),
-        ],
-        DiffTool::Git => vec![
-            String::from("git"),
-            String::from("ls-files"),
-            String::from("--others"),
-            String::from("--exclude-standard"),
-            String::from("--full-name"),
-            String::from("-z"),
-        ],
+        DiffTool::Sl => sl_untracked_command(),
+        DiffTool::Git => git_untracked_command(),
     }
 }
 
@@ -73,36 +77,6 @@ pub(crate) fn parse_untracked_paths(bytes: &[u8]) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
-}
-
-pub(crate) fn sl_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
-    let mut cmd = vec![
-        String::from("sl"),
-        String::from("diff"),
-        String::from("-U"),
-        context.to_string(),
-    ];
-    if let Some(rev) = rev {
-        cmd.push(String::from("-r"));
-        cmd.push(rev.to_owned());
-    }
-    cmd
-}
-
-pub(crate) fn git_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
-    // One argv element. `git diff -U N` is two arguments; git 2.55 treats
-    // `-U` like `-u` (a synonym for `-p`) and then reads `N` as a revision.
-    // `--unified=N` is accepted on both old and new git.
-    let mut cmd = vec![
-        String::from("git"),
-        String::from("diff"),
-        String::from("--no-ext-diff"),
-        format!("--unified={context}"),
-    ];
-    if let Some(rev) = rev {
-        cmd.push(rev.to_owned());
-    }
-    cmd
 }
 
 /// Next context size after `u` (decrease) or `U` (increase).
@@ -180,51 +154,25 @@ fn gitfile_has_sl(gitfile: &Path) -> anyhow::Result<bool> {
 mod tests {
     use std::fs;
 
-    use crate::repo::diff_command_in;
+    use crate::repo::repo::diff_command_in;
 
     fn sl_argv() -> Vec<String> {
-        crate::repo::sl_diff_command(crate::repo::DEFAULT_CONTEXT, None)
+        crate::repo::sl::sl_diff_command(crate::repo::repo::DEFAULT_CONTEXT, None)
     }
 
     fn git_argv() -> Vec<String> {
-        crate::repo::git_diff_command(crate::repo::DEFAULT_CONTEXT, None)
+        crate::repo::git::git_diff_command(crate::repo::repo::DEFAULT_CONTEXT, None)
     }
 
     #[test]
     fn test_step_context_clamps() {
-        assert_eq!(0, crate::repo::step_context(0, false));
-        assert_eq!(1, crate::repo::step_context(0, true));
-        assert_eq!(2, crate::repo::step_context(3, false));
-        assert_eq!(4, crate::repo::step_context(3, true));
+        assert_eq!(0, crate::repo::repo::step_context(0, false));
+        assert_eq!(1, crate::repo::repo::step_context(0, true));
+        assert_eq!(2, crate::repo::repo::step_context(3, false));
+        assert_eq!(4, crate::repo::repo::step_context(3, true));
         assert_eq!(
-            crate::repo::MAX_CONTEXT,
-            crate::repo::step_context(crate::repo::MAX_CONTEXT, true)
-        );
-    }
-
-    #[test]
-    fn test_untracked_command_argv() {
-        assert_eq!(
-            vec![
-                String::from("sl"),
-                String::from("status"),
-                String::from("-u"),
-                String::from("-n"),
-                String::from("-0"),
-                String::from("--root-relative"),
-            ],
-            crate::repo::untracked_command_for_tool(crate::repo::DiffTool::Sl)
-        );
-        assert_eq!(
-            vec![
-                String::from("git"),
-                String::from("ls-files"),
-                String::from("--others"),
-                String::from("--exclude-standard"),
-                String::from("--full-name"),
-                String::from("-z"),
-            ],
-            crate::repo::untracked_command_for_tool(crate::repo::DiffTool::Git)
+            crate::repo::repo::MAX_CONTEXT,
+            crate::repo::repo::step_context(crate::repo::repo::MAX_CONTEXT, true)
         );
     }
 
@@ -232,11 +180,11 @@ mod tests {
     fn test_parse_untracked_paths_sorts_and_skips_empty() {
         assert_eq!(
             Vec::<String>::new(),
-            crate::repo::parse_untracked_paths(b"")
+            crate::repo::repo::parse_untracked_paths(b"")
         );
         assert_eq!(
             Vec::<String>::new(),
-            crate::repo::parse_untracked_paths(b"\0")
+            crate::repo::repo::parse_untracked_paths(b"\0")
         );
         assert_eq!(
             vec![
@@ -244,55 +192,12 @@ mod tests {
                 String::from("file with space"),
                 String::from("z"),
             ],
-            crate::repo::parse_untracked_paths(b"z\0a/b\0file with space\0\0z\0")
+            crate::repo::repo::parse_untracked_paths(b"z\0a/b\0file with space\0\0z\0")
         );
         // A newline inside a path is preserved because the separator is NUL.
         assert_eq!(
             vec![String::from("a\nb")],
-            crate::repo::parse_untracked_paths(b"a\nb\0")
-        );
-    }
-
-    #[test]
-    fn test_command_includes_unified_context() {
-        assert_eq!(
-            vec![
-                String::from("sl"),
-                String::from("diff"),
-                String::from("-U"),
-                String::from("5"),
-            ],
-            crate::repo::sl_diff_command(5, None)
-        );
-        assert_eq!(
-            vec![
-                String::from("git"),
-                String::from("diff"),
-                String::from("--no-ext-diff"),
-                String::from("--unified=8"),
-            ],
-            crate::repo::git_diff_command(8, None)
-        );
-        assert_eq!(
-            vec![
-                String::from("sl"),
-                String::from("diff"),
-                String::from("-U"),
-                String::from("3"),
-                String::from("-r"),
-                String::from(".^"),
-            ],
-            crate::repo::sl_diff_command(3, Some(".^"))
-        );
-        assert_eq!(
-            vec![
-                String::from("git"),
-                String::from("diff"),
-                String::from("--no-ext-diff"),
-                String::from("--unified=3"),
-                String::from("main"),
-            ],
-            crate::repo::git_diff_command(3, Some("main"))
+            crate::repo::repo::parse_untracked_paths(b"a\nb\0")
         );
     }
 

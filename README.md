@@ -47,6 +47,7 @@ or `bin/live-diff`
 | --- | --- |
 | `-n`, `--interval` | Seconds between runs (default `0.5`, or `LIVE_DIFF_INTERVAL`) |
 | `-r`, `--rev` | Revision to compare against. Without this, the tool's default diff |
+| `-c`, `--change` | Diff introduced by one commit. No live refresh |
 | `-U`, `--unified` | Initial context lines (default 3). `u` / `U` change it later |
 | `--sl` | Force `sl diff` |
 | `--git` | Force `git diff` |

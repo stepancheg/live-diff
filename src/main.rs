@@ -38,10 +38,10 @@ use crate::event_loop::EventLoop;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyTx;
 use crate::render::terminal_size;
-use crate::repo::DEFAULT_CONTEXT;
-use crate::repo::DiffTool;
-use crate::repo::MAX_CONTEXT;
-use crate::repo::diff_tool;
+use crate::repo::repo::DEFAULT_CONTEXT;
+use crate::repo::repo::DiffTool;
+use crate::repo::repo::MAX_CONTEXT;
+use crate::repo::repo::diff_tool;
 use crate::search::history::store::History;
 use crate::terminal_bg::query_terminal_bg;
 use crate::terminal_guard::TerminalGuard;
@@ -63,8 +63,14 @@ struct Args {
 
     /// Revision to compare the working copy against.
     /// Without this flag, run the tool's default diff.
-    #[clap(short = 'r', long = "rev")]
+    #[clap(short = 'r', long = "rev", conflicts_with = "commit")]
     rev: Option<String>,
+
+    /// Show only the diff introduced by this commit (`sl diff -c`,
+    /// `git show`). The commit is immutable, so the diff is
+    /// captured once and not refreshed on an interval.
+    #[clap(short = 'c', long = "change", conflicts_with = "rev")]
+    commit: Option<String>,
 
     /// Initial unified-diff context lines. `u` / `U` change it later.
     #[clap(short = 'U', long = "unified", default_value_t = DEFAULT_CONTEXT)]
@@ -90,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         diff_tool()?
     };
     let rev = args.rev;
+    let commit = args.commit;
     let context = Arc::new(AtomicU32::new(args.context.min(MAX_CONTEXT)));
     let history = History::load_from_home().await;
 
@@ -101,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         tool,
         Arc::clone(&context),
         rev,
+        commit,
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
@@ -197,7 +205,7 @@ mod tests {
     #[test]
     fn test_unified_flag_parses() {
         let args = Args::try_parse_from(["live-diff"]).unwrap();
-        assert_eq!(crate::repo::DEFAULT_CONTEXT, args.context);
+        assert_eq!(crate::repo::repo::DEFAULT_CONTEXT, args.context);
         let args = Args::try_parse_from(["live-diff", "-U", "0"]).unwrap();
         assert_eq!(0, args.context);
         let args = Args::try_parse_from(["live-diff", "--unified", "12"]).unwrap();

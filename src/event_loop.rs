@@ -23,7 +23,7 @@ use crate::mark::NOT_SET;
 use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
 use crate::render::ScrollAnchor;
-use crate::repo::step_context;
+use crate::repo::repo::step_context;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;

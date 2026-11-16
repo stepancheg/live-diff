@@ -16,10 +16,10 @@ use tokio::sync::mpsc::Sender;
 use crate::diff::DiffOutput;
 use crate::diff::parse_diff;
 use crate::notify_pair::NotifyRx;
-use crate::repo::DiffTool;
-use crate::repo::command_for_tool;
-use crate::repo::parse_untracked_paths;
-use crate::repo::untracked_command_for_tool;
+use crate::repo::repo::DiffTool;
+use crate::repo::repo::command_for_tool;
+use crate::repo::repo::parse_untracked_paths;
+use crate::repo::repo::untracked_command_for_tool;
 
 /// Result of a capture that may be cut short by `interrupt`.
 pub(crate) enum CaptureOutcome {
@@ -145,13 +145,23 @@ pub(crate) async fn capture_command_output_loop(
     tool: DiffTool,
     context: Arc<AtomicU32>,
     rev: Option<String>,
+    commit: Option<String>,
     interval: Duration,
     tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
+    // A single commit's diff is immutable. Do not poll, and do not
+    // list untracked files (those belong to the working copy). `u`/`U`
+    // and `r` still re-run via `refresh`.
+    let live = commit.is_none();
     let mut cached: Option<CachedSnapshot> = None;
     loop {
-        let command = command_for_tool(tool, context.load(Ordering::SeqCst), rev.as_deref());
+        let command = command_for_tool(
+            tool,
+            context.load(Ordering::SeqCst),
+            rev.as_deref(),
+            commit.as_deref(),
+        );
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let diff = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
@@ -163,17 +173,21 @@ pub(crate) async fn capture_command_output_loop(
         };
         // A failed listing leaves the diff without untracked paths.
         // An interrupt restarts the whole snapshot so the count matches it.
-        let untracked_cmd = untracked_command_for_tool(tool);
-        let untracked = match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
-            Ok(CaptureOutcome::Interrupted) => continue,
-            Ok(CaptureOutcome::Done { bytes, success }) => {
-                if success {
-                    CachedUntracked::Ok(bytes)
-                } else {
-                    CachedUntracked::Failed
+        let untracked = if live {
+            let untracked_cmd = untracked_command_for_tool(tool);
+            match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
+                Ok(CaptureOutcome::Interrupted) => continue,
+                Ok(CaptureOutcome::Done { bytes, success }) => {
+                    if success {
+                        CachedUntracked::Ok(bytes)
+                    } else {
+                        CachedUntracked::Failed
+                    }
                 }
+                Err(_) => CachedUntracked::Failed,
             }
-            Err(_) => CachedUntracked::Failed,
+        } else {
+            CachedUntracked::Ok(Vec::new())
         };
         let unchanged = match &cached {
             Some(prev) => {
@@ -213,9 +227,14 @@ pub(crate) async fn capture_command_output_loop(
                 return;
             }
         }
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = refresh.notified() => {}
+        if live {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = refresh.notified() => {}
+            }
+        } else {
+            // Commit mode: wait for an explicit refresh only.
+            refresh.notified().await;
         }
     }
 }
