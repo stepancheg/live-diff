@@ -156,6 +156,10 @@ impl Renderer {
         self.lines.lines()
     }
 
+    pub(crate) fn terminal_bg(&self) -> TerminalBg {
+        self.terminal_bg
+    }
+
     pub(crate) fn set_status_label(&mut self, label: Option<String>) {
         self.status_label = label;
         self.status_caret = None;

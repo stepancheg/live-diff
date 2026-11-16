@@ -17,15 +17,20 @@ impl Line {
     /// One span of `text` in `style`. Controls are replaced with spaces.
     /// An empty `text` is a blank line with no spans.
     pub(crate) fn from_styled(text: &str, style: Style) -> Line {
+        let mut line = Line::new();
+        line.push_styled(text, style);
+        line
+    }
+
+    /// Append a span. Empty `text` is ignored.
+    pub(crate) fn push_styled(&mut self, text: &str, style: Style) {
         if text.is_empty() {
-            return Line::new();
+            return;
         }
-        Line {
-            spans: vec![Span {
-                style,
-                content: TerminalString::sanitize(text),
-            }],
-        }
+        self.spans.push(Span {
+            style,
+            content: TerminalString::sanitize(text),
+        });
     }
 
     pub(crate) fn width(&self) -> Width {

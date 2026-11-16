@@ -158,6 +158,10 @@ impl DiffOutput {
                 }
             }
         }
+        if lines.is_empty() {
+            // A clean empty diff would otherwise be a blank screen.
+            lines.push(Line::from_styled("(no changes)", diff_note_style()));
+        }
         DiffView {
             lines,
             headers,
@@ -203,31 +207,173 @@ impl FileDiff {
     }
 }
 
-/// One row per file for the file-list mode. `selected` is drawn with a
-/// reverse-video cursor.
-pub(crate) fn file_list_lines(files: &[&FileDiff], selected: usize) -> Vec<Line> {
+/// One row per file for the file-list mode, in `git diff --stat` form:
+/// a path column, `|`, the change count, and a `+`/`-` bar.
+/// `selected` is drawn with a grey / dark-grey background.
+pub(crate) fn file_list_lines(
+    files: &[&FileDiff],
+    selected: usize,
+    terminal_bg: crate::terminal_bg::TerminalBg,
+    width: crate::terminal::width::Width,
+) -> Vec<Line> {
     if files.is_empty() {
         return vec![Line::from_styled("(no files)", diff_note_style())];
     }
+    let cols = usize::try_from(width.0).unwrap_or(0);
+    let names: Vec<String> = files.iter().map(|file| file_header_text(file)).collect();
+    let counts: Vec<(u32, u32)> = files.iter().map(|file| file.change_counts()).collect();
+    let max_change = counts
+        .iter()
+        .map(|(ins, del)| ins.saturating_add(*del))
+        .max()
+        .unwrap_or(0);
+    let any_binary = files.iter().any(|file| file.binary);
+    // "Bin" needs 3 columns; otherwise the decimal width of max_change.
+    let num_w = decimal_width(max_change).max(if any_binary { 3 } else { 1 });
+    // "> " / "  " plus " | " plus the count plus a space before the bar.
+    let cursor_w = 2usize;
+    let fixed = cursor_w + 3 + num_w + 1;
+    let remain = cols.saturating_sub(fixed);
+    let max_name = names
+        .iter()
+        .map(|name| unicode_width::UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0);
+    // Fit the longest path when possible and give the bar the rest.
+    // Otherwise keep a short bar and truncate paths.
+    let (name_w, graph_w) = if max_name <= remain {
+        (max_name, remain - max_name)
+    } else if remain == 0 {
+        (0, 0)
+    } else {
+        let graph_w = (remain / 3).max(1).min(remain.saturating_sub(1));
+        (remain - graph_w, graph_w)
+    };
+
     let mut lines = Vec::with_capacity(files.len());
     for (i, file) in files.iter().enumerate() {
-        let mut text = String::from(if i == selected { "> " } else { "  " });
-        text.push_str(&file_header_text(file));
+        let selected_row = i == selected;
+        let mut name_style = diff_file_header_style();
+        let mut plain_style = Style::plain();
+        let mut ins_style = diff_insert_style();
+        let mut del_style = diff_delete_style();
+        if selected_row {
+            let bg = Some(terminal_bg.row_highlight());
+            name_style.bg = bg;
+            plain_style.bg = bg;
+            ins_style.bg = bg;
+            del_style.bg = bg;
+        }
+        let mut line = Line::new();
+        line.push_styled(if selected_row { "> " } else { "  " }, name_style);
+        let shown = fit_name(&names[i], name_w);
+        line.push_styled(&shown, name_style);
+        let pad = name_w.saturating_sub(unicode_width::UnicodeWidthStr::width(shown.as_str()));
+        if pad > 0 {
+            line.push_styled(&" ".repeat(pad), name_style);
+        }
+        line.push_styled(" | ", plain_style);
         if file.binary {
-            text.push_str("  binary");
+            line.push_styled(&format!("{:>width$}", "Bin", width = num_w), plain_style);
         } else {
-            let (ins, del) = file.change_counts();
-            if ins > 0 || del > 0 {
-                text.push_str(&format!("  +{ins} -{del}"));
+            let (ins, del) = counts[i];
+            let total = ins.saturating_add(del);
+            line.push_styled(&format!("{total:>num_w$}"), plain_style);
+            line.push_styled(" ", plain_style);
+            let (plus, minus) = stat_graph(ins, del, max_change, graph_w);
+            if plus > 0 {
+                line.push_styled(&"+".repeat(plus), ins_style);
+            }
+            if minus > 0 {
+                line.push_styled(&"-".repeat(minus), del_style);
             }
         }
-        let mut style = diff_file_header_style();
-        if i == selected {
-            style.reverse = true;
+        if selected_row {
+            let used = usize::try_from(line.width().0).unwrap_or(0);
+            if used < cols {
+                line.push_styled(&" ".repeat(cols - used), plain_style);
+            }
         }
-        lines.push(Line::from_styled(&text, style));
+        lines.push(line);
     }
     lines
+}
+
+fn decimal_width(n: u32) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut n = n;
+    let mut w = 0;
+    while n > 0 {
+        w += 1;
+        n /= 10;
+    }
+    w
+}
+
+/// Keep the right-hand side of `name` (the file name) when it must shrink.
+fn fit_name(name: &str, max_w: usize) -> String {
+    let w = unicode_width::UnicodeWidthStr::width(name);
+    if w <= max_w {
+        return name.to_owned();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w < 4 {
+        return take_suffix_width(name, max_w);
+    }
+    let mut out = String::from("...");
+    out.push_str(&take_suffix_width(name, max_w - 3));
+    out
+}
+
+fn take_suffix_width(name: &str, max_w: usize) -> String {
+    let mut cols = 0usize;
+    let mut start = name.len();
+    for (i, ch) in name.char_indices().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols + cw > max_w {
+            break;
+        }
+        cols += cw;
+        start = i;
+    }
+    name[start..].to_owned()
+}
+
+/// Split a `+`/`-` bar of at most `graph_w` columns between inserts and
+/// deletes, scaled so the largest file fills the bar.
+fn stat_graph(ins: u32, del: u32, max_change: u32, graph_w: usize) -> (usize, usize) {
+    let total = ins.saturating_add(del);
+    if total == 0 || graph_w == 0 || max_change == 0 {
+        return (0, 0);
+    }
+    let total_us = usize::try_from(total).unwrap_or(usize::MAX);
+    let max_us = usize::try_from(max_change).unwrap_or(usize::MAX);
+    let marks = if max_us <= graph_w {
+        total_us
+    } else {
+        ((total_us.saturating_mul(graph_w)) / max_us).max(1)
+    };
+    if del == 0 {
+        return (marks, 0);
+    }
+    if ins == 0 {
+        return (0, marks);
+    }
+    let ins_us = usize::try_from(ins).unwrap_or(usize::MAX);
+    let mut plus = ins_us.saturating_mul(marks) / total_us;
+    let mut minus = marks.saturating_sub(plus);
+    if plus == 0 {
+        plus = 1;
+        minus = marks.saturating_sub(1);
+    } else if minus == 0 {
+        minus = 1;
+        plus = marks.saturating_sub(1);
+    }
+    (plus, minus)
 }
 
 /// Index of the header span whose file section contains `line`.
@@ -1368,18 +1514,108 @@ diff --git a/bar b/bar
 ";
         let output = parse_diff(input);
         let files = output.files();
-        let lines = crate::diff::file_list_lines(&files, 1);
+        let lines = crate::diff::file_list_lines(
+            &files,
+            1,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+        );
         assert_eq!(2, lines.len());
-        assert_eq!("  foo  +2 -1", lines[0].plain_text());
-        assert_eq!("> bar  +1 -1", lines[1].plain_text());
-        assert_eq!(true, lines[1].spans.iter().any(|s| s.style.reverse));
-        assert_eq!(false, lines[0].spans.iter().any(|s| s.style.reverse));
+        // git --stat: paths padded so `|` aligns, then the change count
+        // and a +/− bar. foo is +2−1 (total 3); bar is +1−1 (total 2).
+        let a = lines[0].plain_text();
+        let b = lines[1].plain_text();
+        assert_eq!(true, a.starts_with("  foo"));
+        assert_eq!(true, b.starts_with("> bar"));
+        let pipe_a = a.find(" | ").unwrap();
+        let pipe_b = b.find(" | ").unwrap();
+        assert_eq!(pipe_a, pipe_b);
+        assert_eq!(true, a[pipe_a..].starts_with(" | 3 "));
+        assert_eq!(true, b[pipe_b..].starts_with(" | 2 "));
+        assert_eq!(
+            true,
+            lines[1]
+                .spans
+                .iter()
+                .all(|s| s.style.bg == Some(crate::terminal::color::TerminalColor::Ansi256(8)))
+        );
+        assert_eq!(true, lines[0].spans.iter().all(|s| s.style.bg.is_none()));
+        assert_eq!(false, lines[1].spans.iter().any(|s| s.style.reverse));
+        let ins = lines[0]
+            .spans
+            .iter()
+            .find(|s| {
+                let t = s.content.as_ref().as_str();
+                !t.is_empty() && t.chars().all(|c| c == '+')
+            })
+            .unwrap();
+        let del = lines[0]
+            .spans
+            .iter()
+            .find(|s| {
+                let t = s.content.as_ref().as_str();
+                !t.is_empty() && t.chars().all(|c| c == '-')
+            })
+            .unwrap();
+        // max change is 3 and the bar is wide, so marks are unscaled:
+        // two inserts and one delete.
+        assert_eq!("++", ins.content.as_ref().as_str());
+        assert_eq!("-", del.content.as_ref().as_str());
+        assert_eq!(
+            Some(crate::terminal::color::TerminalColor::Green),
+            ins.style.fg
+        );
+        assert_eq!(
+            Some(crate::terminal::color::TerminalColor::Red),
+            del.style.fg
+        );
+    }
+
+    #[test]
+    fn test_file_list_stat_aligns_unequal_names() {
+        let input = b"\
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1 +1 @@
+-a
++b
+diff --git a/much/longer/path.rs b/much/longer/path.rs
+--- a/much/longer/path.rs
++++ b/much/longer/path.rs
+@@ -1,4 +1,4 @@
+-a
+-b
+-c
+-d
++w
++x
++y
++z
+";
+        let output = parse_diff(input);
+        let files = output.files();
+        let lines = crate::diff::file_list_lines(
+            &files,
+            0,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(60),
+        );
+        let a = lines[0].plain_text();
+        let b = lines[1].plain_text();
+        assert_eq!(a.find(" | "), b.find(" | "));
+        // 4 deletes + 4 inserts on the long path; 1 and 1 on x.
+        assert_eq!(true, b.contains(" | 8 "));
+        assert_eq!(true, a.contains(" | 2 "));
     }
 
     #[test]
     fn test_empty_input() {
         let output = parse_diff(b"");
         assert_eq!(true, output.files().is_empty());
-        assert_eq!(true, output.view().lines.is_empty());
+        let view = output.view();
+        assert_eq!(1, view.lines.len());
+        assert_eq!("(no changes)", view.lines[0].plain_text());
+        assert_eq!(true, view.headers.is_empty());
     }
 }

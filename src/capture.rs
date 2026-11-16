@@ -89,12 +89,13 @@ pub(crate) async fn capture_command_output_interruptible(
 pub(crate) async fn capture_command_output_loop(
     tool: DiffTool,
     context: Arc<AtomicU32>,
+    rev: Option<String>,
     interval: Duration,
     tx: Sender<DiffOutput>,
     refresh: NotifyRx,
 ) {
     loop {
-        let command = command_for_tool(tool, context.load(Ordering::SeqCst));
+        let command = command_for_tool(tool, context.load(Ordering::SeqCst), rev.as_deref());
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let output = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,

@@ -432,7 +432,12 @@ impl EventLoop {
         } else if self.file_list_index >= n {
             self.file_list_index = n - 1;
         }
-        let lines = file_list_lines(&files, self.file_list_index);
+        let lines = file_list_lines(
+            &files,
+            self.file_list_index,
+            self.help_renderer.terminal_bg(),
+            self.size.width,
+        );
         self.help_renderer.set_lines(lines);
         self.help_renderer
             .set_status_label(Some(String::from("Enter: go to file")));
@@ -492,9 +497,9 @@ impl EventLoop {
         let n = self.output.files().len();
         let page = list_page_size(self.size);
         match action {
-            KeyAction::Quit | KeyAction::FileList | KeyAction::DismissMessage => {
-                self.close_file_list()
-            }
+            KeyAction::Quit => Ok(KeyResult::Quit),
+            KeyAction::FileList => self.open_selected_file(),
+            KeyAction::DismissMessage => self.close_file_list(),
             KeyAction::Help => {
                 // Leave the list and show help.
                 self.mode = Mode::Help;
@@ -837,7 +842,7 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('G') | KeyCode::End => Some(KeyAction::ScrollBottom),
         KeyCode::Char(' ') | KeyCode::PageDown => Some(KeyAction::ScrollPageDown),
         KeyCode::PageUp => Some(KeyAction::ScrollPageUp),
-        KeyCode::Char('f')
+        KeyCode::Char('s')
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {

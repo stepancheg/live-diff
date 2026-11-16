@@ -17,7 +17,8 @@ pub(crate) const MAX_CONTEXT: u32 = 999;
 
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn diff_command_in(dir: &Path) -> anyhow::Result<Vec<String>> {
-    Ok(command_for_tool(diff_tool_in(dir)?, DEFAULT_CONTEXT))
+    let tool = diff_tool_in(dir)?;
+    Ok(command_for_tool(tool, DEFAULT_CONTEXT, None))
 }
 
 pub(crate) fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
@@ -29,33 +30,39 @@ pub(crate) fn diff_tool() -> anyhow::Result<DiffTool> {
     diff_tool_in(&dir)
 }
 
-pub(crate) fn command_for_tool(tool: DiffTool, context: u32) -> Vec<String> {
+pub(crate) fn command_for_tool(tool: DiffTool, context: u32, rev: Option<&str>) -> Vec<String> {
     match tool {
-        DiffTool::Sl => sl_diff_command(context),
-        DiffTool::Git => git_diff_command(context),
+        DiffTool::Sl => sl_diff_command(context, rev),
+        DiffTool::Git => git_diff_command(context, rev),
     }
 }
 
-pub(crate) fn sl_diff_command(context: u32) -> Vec<String> {
-    vec![
+pub(crate) fn sl_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
+    let mut cmd = vec![
         String::from("sl"),
         String::from("diff"),
         String::from("-U"),
         context.to_string(),
-        String::from("-r"),
-        String::from("prev"),
-    ]
+    ];
+    if let Some(rev) = rev {
+        cmd.push(String::from("-r"));
+        cmd.push(rev.to_owned());
+    }
+    cmd
 }
 
-pub(crate) fn git_diff_command(context: u32) -> Vec<String> {
-    vec![
+pub(crate) fn git_diff_command(context: u32, rev: Option<&str>) -> Vec<String> {
+    let mut cmd = vec![
         String::from("git"),
         String::from("diff"),
         String::from("--no-ext-diff"),
         String::from("-U"),
         context.to_string(),
-        String::from("HEAD^"),
-    ]
+    ];
+    if let Some(rev) = rev {
+        cmd.push(rev.to_owned());
+    }
+    cmd
 }
 
 /// Next context size after `u` (decrease) or `U` (increase).
@@ -136,11 +143,11 @@ mod tests {
     use crate::repo::diff_command_in;
 
     fn sl_argv() -> Vec<String> {
-        crate::repo::sl_diff_command(crate::repo::DEFAULT_CONTEXT)
+        crate::repo::sl_diff_command(crate::repo::DEFAULT_CONTEXT, None)
     }
 
     fn git_argv() -> Vec<String> {
-        crate::repo::git_diff_command(crate::repo::DEFAULT_CONTEXT)
+        crate::repo::git_diff_command(crate::repo::DEFAULT_CONTEXT, None)
     }
 
     #[test]
@@ -163,10 +170,8 @@ mod tests {
                 String::from("diff"),
                 String::from("-U"),
                 String::from("5"),
-                String::from("-r"),
-                String::from("prev"),
             ],
-            crate::repo::sl_diff_command(5)
+            crate::repo::sl_diff_command(5, None)
         );
         assert_eq!(
             vec![
@@ -175,9 +180,30 @@ mod tests {
                 String::from("--no-ext-diff"),
                 String::from("-U"),
                 String::from("8"),
-                String::from("HEAD^"),
             ],
-            crate::repo::git_diff_command(8)
+            crate::repo::git_diff_command(8, None)
+        );
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("diff"),
+                String::from("-U"),
+                String::from("3"),
+                String::from("-r"),
+                String::from(".^"),
+            ],
+            crate::repo::sl_diff_command(3, Some(".^"))
+        );
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("diff"),
+                String::from("--no-ext-diff"),
+                String::from("-U"),
+                String::from("3"),
+                String::from("main"),
+            ],
+            crate::repo::git_diff_command(3, Some("main"))
         );
     }
 

@@ -52,13 +52,18 @@ struct Args {
     #[clap(short = 'n', long, env = "LIVE_DIFF_INTERVAL", default_value = "0.5")]
     interval: IntervalArg,
 
-    /// Use `sl diff -r prev`.
+    /// Use `sl diff`.
     #[clap(long, conflicts_with = "git")]
     sl: bool,
 
-    /// Use `git diff HEAD^`.
+    /// Use `git diff`.
     #[clap(long, conflicts_with = "sl")]
     git: bool,
+
+    /// Revision to compare the working copy against.
+    /// Without this flag, run the tool's default diff.
+    #[clap(short = 'r', long = "rev")]
+    rev: Option<String>,
 }
 
 fn install_panic_hook() {
@@ -79,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         diff_tool()?
     };
+    let rev = args.rev;
     let context = Arc::new(AtomicU32::new(DEFAULT_CONTEXT));
     let history = History::load_from_home().await;
 
@@ -89,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
         tool,
         Arc::clone(&context),
+        rev,
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
@@ -170,6 +177,16 @@ mod tests {
         let args = Args::try_parse_from(["live-diff", "--git"]).unwrap();
         assert_eq!(false, args.sl);
         assert_eq!(true, args.git);
+    }
+
+    #[test]
+    fn test_rev_flag_parses() {
+        let args = Args::try_parse_from(["live-diff", "-r", ".^"]).unwrap();
+        assert_eq!(Some(String::from(".^")), args.rev);
+        let args = Args::try_parse_from(["live-diff", "--rev", "main"]).unwrap();
+        assert_eq!(Some(String::from("main")), args.rev);
+        let args = Args::try_parse_from(["live-diff"]).unwrap();
+        assert_eq!(None, args.rev);
     }
 }
 
