@@ -23,6 +23,7 @@ mod wrapped_row;
 use std::io;
 use std::panic;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -129,6 +130,15 @@ fn install_panic_hook() {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let spec = capture_spec(&args)?;
+    // `d` can switch to a working-copy mode; that needs the repo tool.
+    // A PR diff may run outside a repository, in which case the menu
+    // cannot switch.
+    let menu_tool = match &spec {
+        CaptureSpec::Live { tool, .. } => Some(*tool),
+        CaptureSpec::Commit { tool, .. } => Some(*tool),
+        CaptureSpec::Fixed { .. } => diff_tool().ok(),
+    };
+    let spec = Arc::new(Mutex::new(spec));
     let context = Arc::new(AtomicU32::new(args.context.min(MAX_CONTEXT)));
     let history = History::load_from_home().await;
 
@@ -137,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
     let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
-        spec,
+        Arc::clone(&spec),
         Arc::clone(&context),
         args.interval.as_duration(),
         output_tx,
@@ -160,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
     let (_key_reader, keys) = spawn_key_reader(stop);
 
-    EventLoop::new(terminal_bg, history, size, context)
+    EventLoop::new(terminal_bg, history, size, context, spec, menu_tool)
         .run(first_lines, output_rx, keys, refresh_tx, capture_task)
         .await
 }

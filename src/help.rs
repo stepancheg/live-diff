@@ -2,11 +2,24 @@ use crate::terminal::line::Line;
 use crate::terminal::parse::parse_command_output;
 
 const HELP: &str = "\
-Keys
+Mode switch
+
+  d              Diff mode
+  s              Diff stat
+  r              Run the diff command now
+  u              Decrease context
+  U              Increase context
+
+In the diff mode list, j/k move, Enter selects, Esc or d returns.
+Modes are the default diff, diff -c ., and diff -r prev
+(git: default diff, show HEAD, diff HEAD^).
+In the diff stat, j/k move, Enter or s goes to the file, Esc returns, q quits.
+Untracked files are listed after the stat.
+
+Navigation
 
   h              Show this help
   q              Quit
-  r              Run the diff command now
   j, Down, Enter Scroll down
   k, Up          Scroll up
   Space, PgDn    Page down
@@ -19,16 +32,11 @@ Keys
   N              Repeat search in reverse
   mx             Mark current position as x
   'x             Go to mark x
-  s              Diff stat
-  u              Decrease context
-  U              Increase context
   -i             Toggle ignore case
   -I             Always ignore case
   ^l             Redraw
 
 q or h closes this page.
-In the diff stat, j/k move, Enter or s goes to the file, Esc returns, q quits.
-Untracked files are listed after the stat.
 In the prompt, Enter searches. Up and Down recall previous searches.
 Esc cancels the prompt or clears Pattern not found.
 ";
@@ -68,6 +76,8 @@ mod tests {
             })
             .collect::<Vec<String>>()
             .join("\n");
+        assert_eq!(true, text.contains("Mode switch"));
+        assert_eq!(true, text.contains("Navigation"));
         assert_eq!(true, text.contains("h              Show this help"));
         assert_eq!(
             true,
@@ -92,6 +102,7 @@ mod tests {
         );
         assert_eq!(true, text.contains("'x             Go to mark x"));
         assert_eq!(true, text.contains("s              Diff stat"));
+        assert_eq!(true, text.contains("d              Diff mode"));
         assert_eq!(true, text.contains("u              Decrease context"));
         assert_eq!(true, text.contains("U              Increase context"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));
@@ -105,18 +116,18 @@ mod tests {
     fn test_help_draws_key_list() {
         let size = Size {
             width: Width(80),
-            height: Height(30),
+            height: Height(45),
         };
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
         renderer.set_lines(help_lines());
         let mut buf = Vec::new();
         renderer.draw(&mut buf).unwrap();
-        let mut parser = vt_parser(30, 80);
+        let mut parser = vt_parser(45, 80);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));
         let mut ruler = String::new();
         for col in 77..80 {
-            let cell = parser.screen().cell(29, col).unwrap();
+            let cell = parser.screen().cell(44, col).unwrap();
             if cell.has_contents() {
                 ruler.push_str(cell.contents());
             }

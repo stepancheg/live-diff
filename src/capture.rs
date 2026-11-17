@@ -144,6 +144,7 @@ enum CachedUntracked {
 }
 
 /// What the capture loop should run.
+#[derive(Clone)]
 pub(crate) enum CaptureSpec {
     /// Working-copy diff (optional `rev`). Polled on an interval.
     /// Untracked files are listed with each snapshot.
@@ -157,10 +158,164 @@ pub(crate) enum CaptureSpec {
     Fixed { command: Vec<String> },
 }
 
+/// Choices on the `d` diff-mode menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffViewKind {
+    /// Tool default working-copy diff.
+    Default,
+    /// Diff introduced by the current commit (`-c .` / `show HEAD`).
+    ChangeCurrent,
+    /// Working copy against the previous commit (`-r prev` / `HEAD^`).
+    RevPrev,
+}
+
+pub(crate) const DIFF_VIEW_KINDS: [DiffViewKind; 3] = [
+    DiffViewKind::Default,
+    DiffViewKind::ChangeCurrent,
+    DiffViewKind::RevPrev,
+];
+
+impl DiffViewKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DiffViewKind::Default => "default diff",
+            DiffViewKind::ChangeCurrent => "diff -c .",
+            DiffViewKind::RevPrev => "diff -r prev",
+        }
+    }
+}
+
+/// Status-bar name for a fixed PR (or other) command.
+fn fixed_command_status(command: &[String]) -> String {
+    let Some(program) = command.first() else {
+        return String::from("diff");
+    };
+    let mut number = "";
+    for arg in command.iter().rev() {
+        if arg.is_empty() {
+            continue;
+        }
+        if arg.bytes().all(|b| b.is_ascii_digit()) {
+            number = arg.as_str();
+            break;
+        }
+    }
+    if number.is_empty() {
+        return program.clone();
+    }
+    if program == "origin" {
+        return format!("origin pr {number}");
+    }
+    if program == "gh" {
+        return format!("gh pr {number}");
+    }
+    format!("{program} {number}")
+}
+
+/// Revision naming the current commit for `tool`.
+fn current_commit_rev(tool: DiffTool) -> &'static str {
+    match tool {
+        DiffTool::Sl => ".",
+        DiffTool::Git => "HEAD",
+    }
+}
+
+/// Revision naming the parent of the current commit for `tool`.
+/// Sapling's `prev` is that parent; git's equivalent is `HEAD^`.
+fn prev_rev(tool: DiffTool) -> &'static str {
+    match tool {
+        DiffTool::Sl => "prev",
+        DiffTool::Git => "HEAD^",
+    }
+}
+
+impl CaptureSpec {
+    pub(crate) fn for_kind(tool: DiffTool, kind: DiffViewKind) -> CaptureSpec {
+        match kind {
+            DiffViewKind::Default => CaptureSpec::Live { tool, rev: None },
+            DiffViewKind::ChangeCurrent => CaptureSpec::Commit {
+                tool,
+                commit: String::from(current_commit_rev(tool)),
+            },
+            DiffViewKind::RevPrev => CaptureSpec::Live {
+                tool,
+                rev: Some(String::from(prev_rev(tool))),
+            },
+        }
+    }
+
+    /// Which menu row this spec is, if it is one of the three modes.
+    pub(crate) fn view_kind(&self) -> Option<DiffViewKind> {
+        match self {
+            CaptureSpec::Live { tool: _, rev: None } => Some(DiffViewKind::Default),
+            CaptureSpec::Live {
+                tool,
+                rev: Some(rev),
+            } => {
+                if rev == prev_rev(*tool) {
+                    Some(DiffViewKind::RevPrev)
+                } else {
+                    None
+                }
+            }
+            CaptureSpec::Commit { tool, commit } => {
+                if commit == current_commit_rev(*tool) {
+                    Some(DiffViewKind::ChangeCurrent)
+                } else {
+                    None
+                }
+            }
+            CaptureSpec::Fixed { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            CaptureSpec::Live { .. } => true,
+            CaptureSpec::Commit { .. } => false,
+            CaptureSpec::Fixed { .. } => false,
+        }
+    }
+
+    /// Short name of this spec for the status bar.
+    pub(crate) fn mode_status(&self) -> String {
+        if let Some(kind) = self.view_kind() {
+            return String::from(kind.label());
+        }
+        match self {
+            CaptureSpec::Live {
+                tool,
+                rev: Some(rev),
+            } => match tool {
+                DiffTool::Sl => format!("diff -r {rev}"),
+                DiffTool::Git => format!("diff {rev}"),
+            },
+            CaptureSpec::Commit { tool, commit } => match tool {
+                DiffTool::Sl => format!("diff -c {commit}"),
+                DiffTool::Git => format!("show {commit}"),
+            },
+            CaptureSpec::Fixed { command } => fixed_command_status(command),
+            CaptureSpec::Live { rev: None, .. } => String::from("default diff"),
+        }
+    }
+
+    pub(crate) fn command(&self, context: u32) -> Vec<String> {
+        match self {
+            CaptureSpec::Live { tool, rev } => {
+                command_for_tool(*tool, context, rev.as_deref(), None)
+            }
+            CaptureSpec::Commit { tool, commit } => {
+                command_for_tool(*tool, context, None, Some(commit.as_str()))
+            }
+            CaptureSpec::Fixed { command } => command.clone(),
+        }
+    }
+}
+
 /// Capture in a loop, sending each snapshot on `tx`.
 /// `refresh` kills the current command and starts the next run at once.
 pub(crate) async fn capture_command_output_loop(
-    spec: CaptureSpec,
+    shared_spec: Arc<std::sync::Mutex<CaptureSpec>>,
     context: Arc<AtomicU32>,
     interval: Duration,
     tx: Sender<DiffOutput>,
@@ -168,26 +323,12 @@ pub(crate) async fn capture_command_output_loop(
 ) {
     // A commit or PR diff is not the working copy. Do not poll, and do
     // not list untracked files. `u`/`U` and `r` still re-run via
-    // `refresh`.
-    let live = match &spec {
-        CaptureSpec::Live { .. } => true,
-        CaptureSpec::Commit { .. } => false,
-        CaptureSpec::Fixed { .. } => false,
-    };
+    // `refresh`. The spec can change under `d`; re-read it each run.
     let mut cached: Option<CachedSnapshot> = None;
     loop {
-        let command = match &spec {
-            CaptureSpec::Live { tool, rev } => {
-                command_for_tool(*tool, context.load(Ordering::SeqCst), rev.as_deref(), None)
-            }
-            CaptureSpec::Commit { tool, commit } => command_for_tool(
-                *tool,
-                context.load(Ordering::SeqCst),
-                None,
-                Some(commit.as_str()),
-            ),
-            CaptureSpec::Fixed { command } => command.clone(),
-        };
+        let spec = shared_spec.lock().unwrap().clone();
+        let live = spec.is_live();
+        let command = spec.command(context.load(Ordering::SeqCst));
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let diff = match outcome {
             Ok(CaptureOutcome::Interrupted) => continue,
@@ -370,6 +511,116 @@ mod tests {
             CaptureOutcome::Done { bytes, .. } => Ok(bytes),
             CaptureOutcome::Interrupted => Err(anyhow::anyhow!("capture interrupted")),
         }
+    }
+
+    #[test]
+    fn test_diff_view_kind_commands() {
+        use crate::capture::CaptureSpec;
+        use crate::capture::DiffViewKind;
+        use crate::repo::repo::DiffTool;
+
+        assert_eq!("default diff", DiffViewKind::Default.label());
+        assert_eq!("diff -c .", DiffViewKind::ChangeCurrent.label());
+        assert_eq!("diff -r prev", DiffViewKind::RevPrev.label());
+
+        let sl_default = CaptureSpec::for_kind(DiffTool::Sl, DiffViewKind::Default);
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("diff"),
+                String::from("-U"),
+                String::from("3"),
+            ],
+            sl_default.command(3)
+        );
+        assert_eq!(Some(DiffViewKind::Default), sl_default.view_kind());
+        assert_eq!(true, sl_default.is_live());
+
+        let sl_change = CaptureSpec::for_kind(DiffTool::Sl, DiffViewKind::ChangeCurrent);
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("show"),
+                String::from("-U"),
+                String::from("3"),
+                String::from("-r"),
+                String::from("."),
+            ],
+            sl_change.command(3)
+        );
+        assert_eq!(Some(DiffViewKind::ChangeCurrent), sl_change.view_kind());
+        assert_eq!(false, sl_change.is_live());
+
+        let sl_prev = CaptureSpec::for_kind(DiffTool::Sl, DiffViewKind::RevPrev);
+        assert_eq!(
+            vec![
+                String::from("sl"),
+                String::from("diff"),
+                String::from("-U"),
+                String::from("3"),
+                String::from("-r"),
+                String::from("prev"),
+            ],
+            sl_prev.command(3)
+        );
+        assert_eq!(Some(DiffViewKind::RevPrev), sl_prev.view_kind());
+        assert_eq!(true, sl_prev.is_live());
+
+        let git_default = CaptureSpec::for_kind(DiffTool::Git, DiffViewKind::Default);
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("diff"),
+                String::from("--no-ext-diff"),
+                String::from("--unified=3"),
+            ],
+            git_default.command(3)
+        );
+
+        let git_change = CaptureSpec::for_kind(DiffTool::Git, DiffViewKind::ChangeCurrent);
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("show"),
+                String::from("--no-ext-diff"),
+                String::from("--unified=3"),
+                String::from("HEAD"),
+            ],
+            git_change.command(3)
+        );
+        assert_eq!(Some(DiffViewKind::ChangeCurrent), git_change.view_kind());
+
+        let git_prev = CaptureSpec::for_kind(DiffTool::Git, DiffViewKind::RevPrev);
+        assert_eq!(
+            vec![
+                String::from("git"),
+                String::from("diff"),
+                String::from("--no-ext-diff"),
+                String::from("--unified=3"),
+                String::from("HEAD^"),
+            ],
+            git_prev.command(3)
+        );
+        assert_eq!(Some(DiffViewKind::RevPrev), git_prev.view_kind());
+
+        assert_eq!("default diff", sl_default.mode_status());
+        assert_eq!("diff -c .", sl_change.mode_status());
+        assert_eq!("diff -r prev", sl_prev.mode_status());
+        assert_eq!("diff -c .", git_change.mode_status());
+        assert_eq!("diff -r prev", git_prev.mode_status());
+        let custom = CaptureSpec::Live {
+            tool: DiffTool::Sl,
+            rev: Some(String::from("main")),
+        };
+        assert_eq!("diff -r main", custom.mode_status());
+        let pr = CaptureSpec::Fixed {
+            command: crate::pr_diff::origin_pr_diff_command(41),
+        };
+        assert_eq!("origin pr 41", pr.mode_status());
+        let gh = CaptureSpec::Fixed {
+            command: crate::pr_diff::github_pr_diff_command(7),
+        };
+        assert_eq!("gh pr 7", gh.mode_status());
     }
 
     #[test]

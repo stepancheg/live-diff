@@ -51,6 +51,9 @@ pub(crate) struct Renderer {
     /// Kept across [`Renderer::set_status_label`] so search and context
     /// messages do not hide it.
     status_note: Option<String>,
+    /// Current diff mode, drawn left of the note and the ruler.
+    /// Kept across [`Renderer::set_status_label`] like [`Self::status_note`].
+    status_mode: Option<String>,
     /// Compiled search regex whose matches are drawn with a search highlight.
     highlight: Option<Highlight>,
     /// Bumped when body rows may have changed (`set_lines` / highlight).
@@ -121,6 +124,7 @@ impl Renderer {
             status_label: None,
             status_caret: None,
             status_note: None,
+            status_mode: None,
             highlight: None,
             content_gen: 0,
             size,
@@ -174,10 +178,16 @@ impl Renderer {
         self.status_note = note;
     }
 
-    /// Right-hand status cluster: the optional note, a space, and the ruler.
-    /// The note is dropped when it would not fit beside the ruler.
+    pub(crate) fn set_status_mode(&mut self, mode: Option<String>) {
+        self.status_mode = mode;
+    }
+
+    /// Right-hand status cluster: optional mode, optional note, and the
+    /// ruler. The note is dropped first when the cluster would not fit;
+    /// the mode is dropped after that.
     fn status_right(&self, ruler: &str) -> String {
         compose_status_right(
+            self.status_mode.as_deref().unwrap_or(""),
             self.status_note.as_deref().unwrap_or(""),
             ruler,
             self.size.width,
@@ -1107,25 +1117,61 @@ fn row_fingerprint(row: &VisualRow) -> String {
     s
 }
 
-/// `note` sits just left of `ruler` when both fit in `width`.
-fn compose_status_right(note: &str, ruler: &str, width: Width) -> String {
+/// `mode` and `note` sit just left of `ruler` when they fit in `width`.
+/// Parts are separated by spaces. If the full cluster is too wide, the
+/// note is omitted first, then the mode.
+fn compose_status_right(mode: &str, note: &str, ruler: &str, width: Width) -> String {
     let ruler_cols = display_width(ruler).0;
     if ruler_cols >= width.0 {
         return take_prefix_cols(ruler, width);
     }
-    if note.is_empty() {
-        return ruler.to_owned();
+    let both = join_status_parts(mode, note, ruler);
+    if display_width(&both).0 <= width.0 {
+        return both;
     }
-    let note_cols = display_width(note).0;
-    // note + separating space + ruler
-    let needed = note_cols.saturating_add(1).saturating_add(ruler_cols);
-    if needed <= width.0 {
-        let mut s = String::from(note);
-        s.push(' ');
-        s.push_str(ruler);
-        return s;
+    if !mode.is_empty() {
+        let mode_ruler = join_status_parts(mode, "", ruler);
+        if display_width(&mode_ruler).0 <= width.0 {
+            return mode_ruler;
+        }
+    }
+    if !note.is_empty() {
+        let note_ruler = join_status_parts("", note, ruler);
+        if display_width(&note_ruler).0 <= width.0 {
+            return note_ruler;
+        }
     }
     ruler.to_owned()
+}
+
+fn join_status_parts(mode: &str, note: &str, ruler: &str) -> String {
+    let mut s = String::new();
+    if !mode.is_empty() {
+        s.push_str(mode);
+    }
+    if !note.is_empty() {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(note);
+    }
+    if !ruler.is_empty() {
+        if !s.is_empty() {
+            // Two spaces between the mode and the ruler when they are
+            // adjacent. The untracked note keeps a single space.
+            if !mode.is_empty() {
+                if note.is_empty() {
+                    s.push_str("  ");
+                } else {
+                    s.push(' ');
+                }
+            } else {
+                s.push(' ');
+            }
+        }
+        s.push_str(ruler);
+    }
+    s
 }
 
 fn status_bar_fingerprint(
@@ -2057,6 +2103,31 @@ diff --git a/foo b/foo
         let mut parser = vt_parser(2, 28);
         parser.process(&buf);
         assert_eq!("context 3    3 untracked Bot", row_text(&parser, 1, 28));
+    }
+
+    #[test]
+    fn test_status_bar_shows_diff_mode() {
+        let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 2));
+        renderer.set_lines(parse_command_output(b"a\n"));
+        renderer.set_status_mode(Some(String::from("diff -c .")));
+        renderer.set_status_note(Some(String::from("3 untracked")));
+        let mut buf = Vec::new();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(2, 40);
+        parser.process(&buf);
+        // mode, note, ruler, right-aligned.
+        assert_eq!(
+            "               diff -c . 3 untracked Bot",
+            row_text(&parser, 1, 40)
+        );
+        // Narrow: keep the mode, drop the untracked note.
+        // "diff -c . Bot" is 13 cols; "diff -c . 3 untracked Bot" is 25.
+        renderer.update_size(size(16, 2));
+        buf.clear();
+        renderer.draw(&mut buf).unwrap();
+        let mut parser = vt_parser(2, 16);
+        parser.process(&buf);
+        assert_eq!("  diff -c .  Bot", row_text(&parser, 1, 16));
     }
 
     #[test]

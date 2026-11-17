@@ -67,6 +67,7 @@ or `bin/live-diff`
 | `g` / `G` | Top / bottom |
 | `/` `?` `n` `N` | Search |
 | `s` | Diff stat (Enter or `s` opens the file, Esc returns) |
+| `d` | Diff mode: default, `-c .`, or `-r prev` |
 | `u` / `U` | Decrease / increase context |
 | `mx` / `'x` | Set / go to mark |
 
