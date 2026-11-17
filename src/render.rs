@@ -1218,10 +1218,12 @@ fn status_bar_fingerprint(
     line
 }
 
-/// Nvim-style ruler for the viewport: `Top`, `Bot`, or `NN%`.
+/// Nvim-style ruler for the viewport: `Top`, `Bot`, or a percent.
+/// Always three columns (`Top`, `Bot`, ` 5%`, `50%`) so the mode
+/// label to its left does not shift while scrolling.
 /// `top` is the first visible row, `end` is one past the last visible
 /// row, and `total` is the number of wrapped rows.
-fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
+pub(crate) fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
     if total == 0 || end >= total {
         return String::from("Bot");
     }
@@ -1230,7 +1232,7 @@ fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
     }
     let pct = (end as u64 * 100 / total as u64) as u32;
     let pct = cmp::min(cmp::max(pct, 1), 99);
-    format!("{pct}%")
+    format!("{pct:>2}%")
 }
 
 fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
@@ -1685,6 +1687,7 @@ mod tests {
     use crate::render::Renderer;
     use crate::render::line_visual_rows;
     use crate::render::row_fingerprint;
+    use crate::render::viewport_ruler;
     use crate::render::visual_rows_in_range;
     use crate::size::Size;
     use crate::terminal::color::TerminalColor;
@@ -1771,6 +1774,17 @@ mod tests {
         assert_eq!("b", row_text(&parser, 0, 10));
         assert_eq!("c", row_text(&parser, 1, 10));
         assert_eq!("       75%", row_text(&parser, 2, 10));
+    }
+
+    #[test]
+    fn test_viewport_ruler_is_three_columns() {
+        assert_eq!("Top", viewport_ruler(0, 1, 10));
+        assert_eq!("Bot", viewport_ruler(0, 10, 10));
+        assert_eq!("Bot", viewport_ruler(9, 10, 10));
+        assert_eq!(" 1%", viewport_ruler(1, 1, 100));
+        assert_eq!(" 9%", viewport_ruler(1, 9, 100));
+        assert_eq!("50%", viewport_ruler(1, 50, 100));
+        assert_eq!("99%", viewport_ruler(1, 99, 100));
     }
 
     #[test]

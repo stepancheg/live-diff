@@ -94,6 +94,14 @@ enum Mode {
     Mark(MarkOp),
 }
 
+/// Which view to show when the pager starts.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StartView {
+    Diff,
+    Stat,
+    Tree,
+}
+
 /// On-screen state for output, help, and the search prompt.
 pub(crate) struct EventLoop {
     renderer: Renderer,
@@ -123,6 +131,8 @@ pub(crate) struct EventLoop {
     /// True when smartlog was opened from the diffstat page, so Esc
     /// returns there.
     smartlog_from_files: bool,
+    /// View to open after the first diff snapshot is applied.
+    start_view: StartView,
 }
 
 impl EventLoop {
@@ -133,6 +143,7 @@ impl EventLoop {
         context: Arc<AtomicU32>,
         spec: Arc<Mutex<CaptureSpec>>,
         tool: Option<DiffTool>,
+        start_view: StartView,
     ) -> EventLoop {
         EventLoop {
             renderer: Renderer::new(terminal_bg, size),
@@ -151,6 +162,7 @@ impl EventLoop {
             smartlog: None,
             smartlog_sel: 0,
             smartlog_from_files: false,
+            start_view,
         }
     }
 
@@ -178,6 +190,7 @@ impl EventLoop {
         capture_task: AbortOnDropHandle<()>,
     ) -> anyhow::Result<()> {
         self.on_command_output(first_lines)?;
+        self.open_start_view()?;
         loop {
             tokio::select! {
                 msg = output_rx.recv() => {
@@ -276,9 +289,36 @@ impl EventLoop {
             // In-place refresh. `draw` skips the terminal write when the
             // visible list is unchanged, so a text selection survives.
             Mode::Files => self.paint_file_list(false)?,
-            _ => self.renderer.draw(&mut io::stdout())?,
+            _ => {
+                // The start view replaces this frame; do not flash the diff.
+                if self.start_view == StartView::Diff {
+                    self.renderer.draw(&mut io::stdout())?;
+                }
+            }
         }
         Ok(())
+    }
+
+    fn open_start_view(&mut self) -> anyhow::Result<()> {
+        let start = self.start_view;
+        self.start_view = StartView::Diff;
+        match start {
+            StartView::Diff => Ok(()),
+            StartView::Stat => {
+                self.open_file_list()?;
+                Ok(())
+            }
+            StartView::Tree => {
+                self.open_smartlog()?;
+                if matches!(self.mode, Mode::Smartlog) {
+                    return Ok(());
+                }
+                match self.renderer.status_label() {
+                    Some(msg) => anyhow::bail!("{msg}"),
+                    None => anyhow::bail!("smartlog failed"),
+                }
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {

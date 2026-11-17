@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render live-diff screenshots with tmux and textimg.
+"""Render sl-tui screenshots with tmux and textimg.
 
 Writes:
   screenshots/diff.png       default diff view
@@ -8,9 +8,9 @@ Writes:
 
 Pass `smartlog` as the only argument to render just that shot.
 
-Needs tmux, dotslash, and a debug build of live-diff (cargo build).
+Needs tmux, dotslash, and a debug build of sl-tui (cargo build).
 screenshots/textimg is a dotslash for textimg. The diff is a fixed
-fixture in a temporary git repository, not the live-diff working tree.
+fixture in a temporary git repository, not the sl-tui working tree.
 The pane is captured at a fixed size and each row is padded to that
 width. SGR state is replayed only onto soft-wrapped continuations.
 """
@@ -32,12 +32,12 @@ ROWS = 12
 # (top of that diff off-screen) and the next file's diff. The ruler
 # is a percentage, not Top/Bot.
 SCROLL_LINES = 85
-SESSION_PREFIX = "live-diff-shot"
+SESSION_PREFIX = "sl-tui-shot"
 
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = Path(__file__).resolve().parent
-BINARY = ROOT / "target" / "debug" / "live-diff"
+BINARY = ROOT / "target" / "debug" / "sl-tui"
 TEXTIMG = OUT_DIR / "textimg"
 # textimg cells are fontSize/2 by fontSize*1.1. Stock Monaco's advance
 # is 1229/2048 em (0.6), so its outlines overlap that grid. We rewrite
@@ -613,12 +613,12 @@ def shot_smartlog(tmux: str, real_git: str) -> None:
     session = f"{SESSION_PREFIX}-sl-{os.getpid()}"
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
     name, email = git_identity(real_git)
-    with tempfile.TemporaryDirectory(prefix="live-diff-sl-shot-") as tmp_s:
+    with tempfile.TemporaryDirectory(prefix="sl-tui-sl-shot-") as tmp_s:
         tmp = Path(tmp_s)
         repo = tmp / "repo"
         home = tmp / "home"
         make_sl_fixture(repo, home, name, email)
-        # live-diff must see the same HOME so `sl smartlog` uses this
+        # sl-tui must see the same HOME so `sl smartlog` uses this
         # repo's commits and the fixture username, not another config.
         argv = [
             tmux,
@@ -699,7 +699,7 @@ def main() -> None:
     session = f"{SESSION_PREFIX}-{os.getpid()}"
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
 
-    with tempfile.TemporaryDirectory(prefix="live-diff-shot-") as tmp_s:
+    with tempfile.TemporaryDirectory(prefix="sl-tui-shot-") as tmp_s:
         tmp = Path(tmp_s)
         repo = tmp / "repo"
         make_fixture(repo, real_git)

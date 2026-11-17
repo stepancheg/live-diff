@@ -6,7 +6,7 @@ use crate::search::history::file::HistoryFile;
 use crate::search::history::file::TRUNCATE_ABOVE;
 use crate::search::history::file::TRUNCATE_TO;
 
-const HISTORY_FILE: &str = ".live-diff.history";
+const HISTORY_FILE: &str = ".sl-tui.history";
 
 pub(crate) struct History {
     entries: Vec<String>,

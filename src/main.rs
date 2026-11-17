@@ -39,6 +39,7 @@ use crate::abort_on_drop_handle::AbortOnDropHandle;
 use crate::capture::CaptureSpec;
 use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
+use crate::event_loop::StartView;
 use crate::interval_arg::IntervalArg;
 use crate::notify_pair::NotifyTx;
 use crate::pr_diff::github_pr_diff_command;
@@ -117,6 +118,14 @@ struct Args {
     /// Initial unified-diff context lines. `u` / `U` change it later.
     #[clap(short = 'U', long = "unified", default_value_t = DEFAULT_CONTEXT)]
     context: u32,
+
+    /// Open the diff stat view.
+    #[clap(long, conflicts_with = "tree")]
+    stat: bool,
+
+    /// Open the smartlog view. Requires a Sapling repository.
+    #[clap(long, conflicts_with = "stat", conflicts_with = "git")]
+    tree: bool,
 }
 
 fn install_panic_hook() {
@@ -138,6 +147,17 @@ async fn main() -> anyhow::Result<()> {
         CaptureSpec::Live { tool, .. } => Some(*tool),
         CaptureSpec::Commit { tool, .. } => Some(*tool),
         CaptureSpec::Fixed { .. } => diff_tool().ok(),
+    };
+    let start_view = if args.tree {
+        match menu_tool {
+            Some(DiffTool::Sl) => StartView::Tree,
+            Some(DiffTool::Git) => anyhow::bail!("--tree requires Sapling"),
+            None => anyhow::bail!("--tree requires a Sapling repository"),
+        }
+    } else if args.stat {
+        StartView::Stat
+    } else {
+        StartView::Diff
     };
     let spec = Arc::new(Mutex::new(spec));
     let context = Arc::new(AtomicU32::new(args.context.min(MAX_CONTEXT)));
@@ -171,9 +191,17 @@ async fn main() -> anyhow::Result<()> {
     let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
     let (_key_reader, keys) = spawn_key_reader(stop);
 
-    EventLoop::new(terminal_bg, history, size, context, spec, menu_tool)
-        .run(first_lines, output_rx, keys, refresh_tx, capture_task)
-        .await
+    EventLoop::new(
+        terminal_bg,
+        history,
+        size,
+        context,
+        spec,
+        menu_tool,
+        start_view,
+    )
+    .run(first_lines, output_rx, keys, refresh_tx, capture_task)
+    .await
 }
 
 /// PR diffs do not need a local repository. A working-copy or commit
@@ -245,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_sl_and_git_flags_conflict() {
-        let err = Args::try_parse_from(["live-diff", "--sl", "--git"]).unwrap_err();
+        let err = Args::try_parse_from(["sl-tui", "--sl", "--git"]).unwrap_err();
         let text = err.to_string();
         assert_eq!(true, text.contains("--sl"));
         assert_eq!(true, text.contains("--git"));
@@ -253,31 +281,31 @@ mod tests {
 
     #[test]
     fn test_sl_flag_parses() {
-        let args = Args::try_parse_from(["live-diff", "--sl"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--sl"]).unwrap();
         assert_eq!(true, args.sl);
         assert_eq!(false, args.git);
     }
 
     #[test]
     fn test_git_flag_parses() {
-        let args = Args::try_parse_from(["live-diff", "--git"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--git"]).unwrap();
         assert_eq!(false, args.sl);
         assert_eq!(true, args.git);
     }
 
     #[test]
     fn test_rev_flag_parses() {
-        let args = Args::try_parse_from(["live-diff", "-r", ".^"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "-r", ".^"]).unwrap();
         assert_eq!(Some(String::from(".^")), args.rev);
-        let args = Args::try_parse_from(["live-diff", "--rev", "main"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--rev", "main"]).unwrap();
         assert_eq!(Some(String::from("main")), args.rev);
-        let args = Args::try_parse_from(["live-diff"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui"]).unwrap();
         assert_eq!(None, args.rev);
     }
 
     #[test]
     fn test_origin_pr_flag_parses() {
-        let args = Args::try_parse_from(["live-diff", "--origin-pr", "41"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--origin-pr", "41"]).unwrap();
         assert_eq!(Some(41), args.origin_pr);
         assert_eq!(None, args.github_pr);
         let spec = crate::capture_spec(&args).unwrap();
@@ -292,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_github_pr_flag_parses() {
-        let args = Args::try_parse_from(["live-diff", "--github-pr", "41"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--github-pr", "41"]).unwrap();
         assert_eq!(Some(41), args.github_pr);
         assert_eq!(None, args.origin_pr);
         let spec = crate::capture_spec(&args).unwrap();
@@ -307,26 +335,42 @@ mod tests {
 
     #[test]
     fn test_pr_flags_conflict_with_each_other_and_rev() {
-        let err = Args::try_parse_from(["live-diff", "--origin-pr", "1", "--github-pr", "2"])
-            .unwrap_err();
-        assert_eq!(true, err.to_string().contains("--origin-pr"));
         let err =
-            Args::try_parse_from(["live-diff", "--origin-pr", "1", "-r", "main"]).unwrap_err();
+            Args::try_parse_from(["sl-tui", "--origin-pr", "1", "--github-pr", "2"]).unwrap_err();
         assert_eq!(true, err.to_string().contains("--origin-pr"));
-        let err = Args::try_parse_from(["live-diff", "--github-pr", "1", "-c", "abc"]).unwrap_err();
+        let err = Args::try_parse_from(["sl-tui", "--origin-pr", "1", "-r", "main"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--origin-pr"));
+        let err = Args::try_parse_from(["sl-tui", "--github-pr", "1", "-c", "abc"]).unwrap_err();
         assert_eq!(true, err.to_string().contains("--github-pr"));
-        let err = Args::try_parse_from(["live-diff", "--origin-pr", "1", "--sl"]).unwrap_err();
+        let err = Args::try_parse_from(["sl-tui", "--origin-pr", "1", "--sl"]).unwrap_err();
         assert_eq!(true, err.to_string().contains("--origin-pr"));
     }
 
     #[test]
     fn test_unified_flag_parses() {
-        let args = Args::try_parse_from(["live-diff"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui"]).unwrap();
         assert_eq!(crate::repo::repo::DEFAULT_CONTEXT, args.context);
-        let args = Args::try_parse_from(["live-diff", "-U", "0"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "-U", "0"]).unwrap();
         assert_eq!(0, args.context);
-        let args = Args::try_parse_from(["live-diff", "--unified", "12"]).unwrap();
+        let args = Args::try_parse_from(["sl-tui", "--unified", "12"]).unwrap();
         assert_eq!(12, args.context);
+    }
+
+    #[test]
+    fn test_stat_and_tree_flags_parse() {
+        let args = Args::try_parse_from(["sl-tui"]).unwrap();
+        assert_eq!(false, args.stat);
+        assert_eq!(false, args.tree);
+        let args = Args::try_parse_from(["sl-tui", "--stat"]).unwrap();
+        assert_eq!(true, args.stat);
+        assert_eq!(false, args.tree);
+        let args = Args::try_parse_from(["sl-tui", "--tree"]).unwrap();
+        assert_eq!(false, args.stat);
+        assert_eq!(true, args.tree);
+        let err = Args::try_parse_from(["sl-tui", "--stat", "--tree"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--stat"));
+        let err = Args::try_parse_from(["sl-tui", "--tree", "--git"]).unwrap_err();
+        assert_eq!(true, err.to_string().contains("--tree"));
     }
 }
 

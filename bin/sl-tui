@@ -8,4 +8,4 @@ project_root=$(cd "$(dirname "$0")/.." && pwd)
     cargo build --quiet
 )
 
-exec "$project_root/target/debug/live-diff" "$@"
+exec "$project_root/target/debug/sl-tui" "$@"

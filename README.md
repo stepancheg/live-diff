@@ -48,7 +48,7 @@ Smartlog (`t`). `@` is the working copy; a side draft joins the stack.
 cargo install --git https://github.com/stepancheg/sl-tui
 ```
 
-or `bin/live-diff`
+or `bin/sl-tui`
 
 ## Options
 
@@ -60,6 +60,8 @@ or `bin/live-diff`
 | `--origin-pr N` | Origin PR diff (`origin pr diff N`). No live refresh |
 | `--github-pr N` | GitHub PR diff (`gh pr diff N`). No live refresh |
 | `-U`, `--unified` | Initial context lines (default 3). `u` / `U` change it later |
+| `--stat` | Open the diff stat view |
+| `--tree` | Open the smartlog view (Sapling) |
 | `--sl` | Force `sl diff` |
 | `--git` | Force `git diff` |
 

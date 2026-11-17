@@ -1,12 +1,13 @@
 [package]
-name = "live-diff"
+name = "sl-tui"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal UI for Sapling: smartlog, live diff, and commit or PR view"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-compact_str = "0.9.0"
+compact_str = "0.10.0"
 crossterm = "0.29.0"
 derive_more = { version = "2.1", features = ["display", "add", "add_assign", "sum"] }
 libc = "0.2.191"

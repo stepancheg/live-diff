@@ -722,7 +722,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_capture_returns_when_child_exits_despite_open_pipe() {
-        let pid_path = PathBuf::from(format!("/tmp/live-diff-capture-test-{}.pid", process::id()));
+        let pid_path = PathBuf::from(format!("/tmp/sl-tui-capture-test-{}.pid", process::id()));
         let _cleanup = KillPidFile {
             path: pid_path.clone(),
         };

@@ -148,16 +148,15 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "compact_str"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
 dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
- "rustversion",
- "ryu",
  "static_assertions",
+ "zmij",
 ]
 
 [[package]]
@@ -290,28 +289,6 @@ name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
-
-[[package]]
-name = "live-diff"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "compact_str",
- "crossterm",
- "derive_more",
- "libc",
- "ref-cast",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "terminal-colorsaurus",
- "tokio",
- "unicode-segmentation",
- "unicode-width",
- "vt100",
-]
 
 [[package]]
 name = "lock_api"
@@ -498,12 +475,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -587,6 +558,28 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "sl-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "compact_str",
+ "crossterm",
+ "derive_more",
+ "libc",
+ "ref-cast",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "terminal-colorsaurus",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+ "vt100",
 ]
 
 [[package]]
