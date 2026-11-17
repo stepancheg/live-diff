@@ -1,6 +1,5 @@
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::debug_or_test::DEBUG_OR_TEST;
 use crate::terminal::line::Line;
 use crate::terminal::span::Span;
 use crate::terminal::style::Style;
@@ -8,6 +7,7 @@ use crate::terminal::terminal_char::TerminalChar;
 use crate::terminal::terminal_str::str::TerminalStr;
 use crate::terminal::terminal_str::string::TerminalString;
 use crate::terminal::width::Width;
+use crate::util::debug_or_test::DEBUG_OR_TEST;
 
 /// Parse command output into lines of styled terminal-char spans.
 ///

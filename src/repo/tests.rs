@@ -9,9 +9,9 @@ use crate::repo::git::git_commit_diff_command;
 use crate::repo::git::git_diff_command;
 use crate::repo::git::git_untracked_command;
 use crate::repo::repo::parse_untracked_paths;
-use crate::repo::sl::sl_commit_diff_command;
-use crate::repo::sl::sl_diff_command;
-use crate::repo::sl::sl_untracked_command;
+use crate::repo::sl::command::sl_commit_diff_command;
+use crate::repo::sl::command::sl_diff_command;
+use crate::repo::sl::command::sl_untracked_command;
 use crate::repo::test_support::TestRepo;
 
 /// Which repository the shared diff-command scenarios run against.

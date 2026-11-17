@@ -619,11 +619,11 @@ mod tests {
         };
         assert_eq!("diff -r main", custom.mode_status());
         let pr = CaptureSpec::Fixed {
-            command: crate::pr_diff::origin_pr_diff_command(41),
+            command: crate::repo::pr_diff::origin_pr_diff_command(41),
         };
         assert_eq!("origin pr 41", pr.mode_status());
         let gh = CaptureSpec::Fixed {
-            command: crate::pr_diff::github_pr_diff_command(7),
+            command: crate::repo::pr_diff::github_pr_diff_command(7),
         };
         assert_eq!("gh pr 7", gh.mode_status());
     }

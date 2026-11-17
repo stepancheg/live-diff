@@ -1,10 +1,10 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::repo::digest::CommitDigest;
-use crate::repo::sl_smartlog::SmartlogCommit;
-use crate::repo::sl_smartlog::SmartlogRow;
-use crate::repo::sl_smartlog::SmartlogRowKind;
-use crate::repo::sl_smartlog::SmartlogView;
+use crate::repo::sl::smartlog::SmartlogCommit;
+use crate::repo::sl::smartlog::SmartlogRow;
+use crate::repo::sl::smartlog::SmartlogRowKind;
+use crate::repo::sl::smartlog::SmartlogView;
 use crate::terminal::color::TerminalColor;
 use crate::terminal::line::Line;
 use crate::terminal::style::Style;
@@ -298,10 +298,10 @@ pub(crate) fn commit_header_row(view: &SmartlogView, commit: usize) -> usize {
 mod tests {
     use crate::repo::digest::CommitDigest;
     use crate::repo::forge::Forge;
-    use crate::repo::sl_smartlog::SmartlogCommit;
-    use crate::repo::sl_smartlog::SmartlogRow;
-    use crate::repo::sl_smartlog::SmartlogRowKind;
-    use crate::repo::sl_smartlog::SmartlogView;
+    use crate::repo::sl::smartlog::SmartlogCommit;
+    use crate::repo::sl::smartlog::SmartlogRow;
+    use crate::repo::sl::smartlog::SmartlogRowKind;
+    use crate::repo::sl::smartlog::SmartlogView;
     use crate::smartlog::SmartlogSelection;
     use crate::smartlog::format_age;
     use crate::smartlog::render_lines;

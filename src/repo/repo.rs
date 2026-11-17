@@ -8,9 +8,9 @@ use anyhow::bail;
 use crate::repo::git::git_commit_diff_command;
 use crate::repo::git::git_diff_command;
 use crate::repo::git::git_untracked_command;
-use crate::repo::sl::sl_commit_diff_command;
-use crate::repo::sl::sl_diff_command;
-use crate::repo::sl::sl_untracked_command;
+use crate::repo::sl::command::sl_commit_diff_command;
+use crate::repo::sl::command::sl_diff_command;
+use crate::repo::sl::command::sl_untracked_command;
 
 /// Diff command for the repository that contains `dir`.
 ///
@@ -158,7 +158,7 @@ mod tests {
     use crate::repo::repo::diff_command_in;
 
     fn sl_argv() -> Vec<String> {
-        crate::repo::sl::sl_diff_command(crate::repo::repo::DEFAULT_CONTEXT, None)
+        crate::repo::sl::command::sl_diff_command(crate::repo::repo::DEFAULT_CONTEXT, None)
     }
 
     fn git_argv() -> Vec<String> {

@@ -1,9 +1,9 @@
 pub(crate) mod digest;
 pub(crate) mod forge;
 mod git;
+pub(crate) mod pr_diff;
 pub(crate) mod repo;
-mod sl;
-pub(crate) mod sl_smartlog;
+pub(crate) mod sl;
 
 #[cfg(test)]
 mod test_support;

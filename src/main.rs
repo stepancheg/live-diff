@@ -1,20 +1,15 @@
-mod abort_on_drop_handle;
 mod capture;
-mod debug_or_test;
 mod diff;
 mod event_loop;
 mod help;
 mod interval_arg;
 mod lines_with_wrapped_row_count;
-mod mark;
-mod pr_diff;
 mod render;
 mod repo;
 mod search;
 mod smartlog;
 mod terminal;
 mod terminal_bg;
-mod terminal_guard;
 mod theme;
 mod util;
 mod wrapped_row;
@@ -32,24 +27,24 @@ use clap::Parser;
 use crossterm::event::Event;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_util::task::AbortOnDropHandle;
 
-use crate::abort_on_drop_handle::AbortOnDropHandle;
 use crate::capture::CaptureSpec;
 use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
 use crate::event_loop::StartView;
 use crate::interval_arg::IntervalArg;
-use crate::pr_diff::github_pr_diff_command;
-use crate::pr_diff::origin_pr_diff_command;
 use crate::render::terminal_size;
+use crate::repo::pr_diff::github_pr_diff_command;
+use crate::repo::pr_diff::origin_pr_diff_command;
 use crate::repo::repo::DEFAULT_CONTEXT;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::MAX_CONTEXT;
 use crate::repo::repo::diff_tool;
 use crate::search::history::store::History;
+use crate::terminal::guard::TerminalGuard;
+use crate::terminal::guard::restore_terminal;
 use crate::terminal_bg::query_terminal_bg;
-use crate::terminal_guard::TerminalGuard;
-use crate::terminal_guard::restore_terminal;
 use crate::util::notify_pair::NotifyTx;
 
 #[derive(clap::Parser, Debug)]
@@ -165,13 +160,13 @@ async fn main() -> anyhow::Result<()> {
     // screen is not shown empty while the command runs.
     let (output_tx, mut output_rx) = mpsc::channel(1);
     let (refresh_tx, refresh_rx) = NotifyTx::pair();
-    let capture_task = AbortOnDropHandle::spawn(capture_command_output_loop(
+    let capture_task = AbortOnDropHandle::new(tokio::spawn(capture_command_output_loop(
         Arc::clone(&spec),
         Arc::clone(&context),
         args.interval.as_duration(),
         output_tx,
         refresh_rx,
-    ));
+    )));
     let Some(first_lines) = output_rx.recv().await else {
         capture_task.await?;
         return Ok(());
@@ -238,7 +233,7 @@ fn spawn_key_reader(
     stop: Arc<AtomicBool>,
 ) -> (AbortOnDropHandle<()>, UnboundedReceiver<io::Result<Event>>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let handle = AbortOnDropHandle::spawn_blocking(move || {
+    let handle = AbortOnDropHandle::new(tokio::task::spawn_blocking(move || {
         while !stop.load(Ordering::SeqCst) {
             match crossterm::event::poll(Duration::from_millis(50)) {
                 Ok(false) => {}
@@ -259,7 +254,7 @@ fn spawn_key_reader(
                 }
             }
         }
-    });
+    }));
     (handle, rx)
 }
 
@@ -309,7 +304,7 @@ mod tests {
         let spec = crate::capture_spec(&args).unwrap();
         match spec {
             crate::capture::CaptureSpec::Fixed { command } => {
-                assert_eq!(crate::pr_diff::origin_pr_diff_command(41), command);
+                assert_eq!(crate::repo::pr_diff::origin_pr_diff_command(41), command);
             }
             crate::capture::CaptureSpec::Live { .. } => panic!("expected fixed command"),
             crate::capture::CaptureSpec::Commit { .. } => panic!("expected fixed command"),
@@ -324,7 +319,7 @@ mod tests {
         let spec = crate::capture_spec(&args).unwrap();
         match spec {
             crate::capture::CaptureSpec::Fixed { command } => {
-                assert_eq!(crate::pr_diff::github_pr_diff_command(41), command);
+                assert_eq!(crate::repo::pr_diff::github_pr_diff_command(41), command);
             }
             crate::capture::CaptureSpec::Live { .. } => panic!("expected fixed command"),
             crate::capture::CaptureSpec::Commit { .. } => panic!("expected fixed command"),

@@ -32,8 +32,8 @@ mod tests {
 
     use crate::diff::HunkLineKind;
     use crate::diff::parse_diff;
-    use crate::pr_diff::github_pr_diff_command;
-    use crate::pr_diff::origin_pr_diff_command;
+    use crate::repo::pr_diff::github_pr_diff_command;
+    use crate::repo::pr_diff::origin_pr_diff_command;
 
     #[test]
     fn test_origin_pr_diff_command_runs() {

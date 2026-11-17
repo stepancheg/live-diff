@@ -1,5 +1,7 @@
+use bstr::ByteSlice;
 use unicode_width::UnicodeWidthChar;
 
+use crate::terminal::esc::strip_esc;
 use crate::terminal::line::Line;
 use crate::terminal::parse::parse_command_output;
 use crate::terminal::style::Style;
@@ -607,74 +609,13 @@ struct RawLine {
 }
 
 fn split_raw_lines(input: &[u8]) -> Vec<RawLine> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(input);
     let mut lines = Vec::new();
-    for part in text.split('\n') {
-        let part = part.strip_suffix('\r').unwrap_or(part);
-        lines.push(RawLine {
-            raw: part.to_owned(),
-            plain: strip_ansi(part),
-        });
-    }
-    if text.ends_with('\n') {
-        lines.pop();
+    for part in input.lines() {
+        let raw = String::from_utf8_lossy(part).into_owned();
+        let plain = strip_esc(&raw);
+        lines.push(RawLine { raw, plain });
     }
     lines
-}
-
-/// Drop CSI, OSC, and other ESC sequences. The remaining text is what
-/// the diff grammar is matched against.
-fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != 0x1b {
-            // Copy one UTF-8 character.
-            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            out.push_str(&s[i..i + ch_len]);
-            i += ch_len;
-            continue;
-        }
-        i += 1;
-        if i >= bytes.len() {
-            break;
-        }
-        match bytes[i] {
-            b'[' => {
-                i += 1;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    i += 1;
-                    if (0x40..=0x7e).contains(&b) {
-                        break;
-                    }
-                }
-            }
-            b']' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == 0x07 {
-                        i += 1;
-                        break;
-                    }
-                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                // Two-byte ESC sequence: skip the final byte.
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 fn parse_file(lines: &[RawLine], start: usize) -> Option<(FileDiff, usize)> {

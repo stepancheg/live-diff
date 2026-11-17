@@ -162,8 +162,10 @@ struct RawCommit {
     phase: String,
     bookmarks: Vec<String>,
     desc: String,
-    /// Absent PR is JSON null or `""`, depending on the repo.
-    pr: serde_json::Value,
+    /// `github_pull_request_number` is `Optional[int]`; `|json` writes
+    /// a number or null.
+    #[serde(default)]
+    pr: Option<u64>,
     #[serde(default)]
     user: String,
     #[serde(default)]
@@ -187,7 +189,7 @@ fn parse_smartlog_line(line: &str) -> anyhow::Result<SmartlogCommit> {
         phase: raw.phase,
         bookmarks: raw.bookmarks,
         desc: raw.desc,
-        github_pr: github_pr_number(&raw.pr)?,
+        github_pr: raw.pr,
         author: raw.user,
         date_unix: hgdate_unix(&raw.date),
         current: raw.cur == "1",
@@ -199,26 +201,6 @@ fn hgdate_unix(date: &str) -> TimestampsSecs {
         return TimestampsSecs(0);
     };
     TimestampsSecs(secs.parse::<i64>().unwrap_or(0))
-}
-
-fn github_pr_number(value: &serde_json::Value) -> anyhow::Result<Option<u64>> {
-    match value {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(text) => {
-            if text.is_empty() {
-                return Ok(None);
-            }
-            let number = text.parse::<u64>()?;
-            Ok(Some(number))
-        }
-        serde_json::Value::Number(number) => {
-            let Some(value) = number.as_u64() else {
-                anyhow::bail!("github pr number is not a u64");
-            };
-            Ok(Some(value))
-        }
-        _ => anyhow::bail!("github pr number has unexpected json type"),
-    }
 }
 
 /// Index of the current commit (`@`), if it is in the view.
@@ -250,8 +232,8 @@ pub(crate) fn find_commit_index(view: &SmartlogView, rev: &str) -> Option<usize>
 #[cfg(test)]
 mod tests {
     use crate::repo::digest::CommitDigest;
-    use crate::repo::sl_smartlog::parse_smartlog;
-    use crate::repo::sl_smartlog::sl_smartlog_command;
+    use crate::repo::sl::smartlog::parse_smartlog;
+    use crate::repo::sl::smartlog::sl_smartlog_command;
     use crate::repo::test_support::TestRepo;
     use crate::util::time::ts_secs::TimestampsSecs;
 
@@ -305,7 +287,7 @@ mod tests {
         let right = sl_commit(&repo, "right");
 
         let bytes = repo.run_ok(&sl_smartlog_command());
-        let view = crate::repo::sl_smartlog::parse_smartlog_view(&bytes).unwrap();
+        let view = crate::repo::sl::smartlog::parse_smartlog_view(&bytes).unwrap();
         let graph: String = view
             .rows
             .iter()
@@ -340,11 +322,11 @@ mod tests {
 
     #[test]
     fn test_find_commit_index_by_hash_prefix() {
-        use crate::repo::sl_smartlog::SmartlogCommit;
-        use crate::repo::sl_smartlog::SmartlogRow;
-        use crate::repo::sl_smartlog::SmartlogRowKind;
-        use crate::repo::sl_smartlog::SmartlogView;
-        use crate::repo::sl_smartlog::find_commit_index;
+        use crate::repo::sl::smartlog::SmartlogCommit;
+        use crate::repo::sl::smartlog::SmartlogRow;
+        use crate::repo::sl::smartlog::SmartlogRowKind;
+        use crate::repo::sl::smartlog::SmartlogView;
+        use crate::repo::sl::smartlog::find_commit_index;
         let commit = |node: &str, current: bool| SmartlogCommit {
             node: CommitDigest(String::from(node)),
             parents: Vec::new(),

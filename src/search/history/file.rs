@@ -8,8 +8,7 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
-
-use crate::abort_on_drop_handle::AbortOnDropHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 pub(crate) const TRUNCATE_ABOVE: usize = 2000;
 pub(crate) const TRUNCATE_TO: usize = 1000;
@@ -31,7 +30,7 @@ impl HistoryFile {
             .unwrap_or_else(|_| Vec::new());
         let line_count = entries.len();
         let (writes, rx) = tokio::sync::mpsc::unbounded_channel();
-        let writer = AbortOnDropHandle::spawn(run_writer(rx, file, line_count));
+        let writer = AbortOnDropHandle::new(tokio::spawn(run_writer(rx, file, line_count)));
         (Some(HistoryFile { writes, writer }), entries)
     }
 
