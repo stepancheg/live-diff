@@ -38,6 +38,10 @@ Diff stat for the same tree.
 
 ![Diff stat](screenshots/diffstat.png)
 
+Smartlog (`t`). `@` is the working copy; a side draft joins the stack.
+
+![Smartlog](screenshots/smartlog.png)
+
 ## Installation
 
 ```

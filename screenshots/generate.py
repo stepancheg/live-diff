@@ -2,8 +2,11 @@
 """Render live-diff screenshots with tmux and textimg.
 
 Writes:
-  screenshots/diff.png      default diff view
-  screenshots/diffstat.png  diff-stat view (key s)
+  screenshots/diff.png       default diff view
+  screenshots/diffstat.png   diff-stat view (key s)
+  screenshots/smartlog.png   smartlog view (key t)
+
+Pass `smartlog` as the only argument to render just that shot.
 
 Needs tmux, dotslash, and a debug build of live-diff (cargo build).
 screenshots/textimg is a dotslash for textimg. The diff is a fixed
@@ -47,6 +50,8 @@ FONT_SIZE = 28
 # CSI SGR only. Other CSI (cursor motion) is dropped if present.
 SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
 CSI_OTHER_RE = re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]")
+# OSC 8 hyperlinks (and other OSC) are not painted by textimg.
+OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
 def die(msg: str) -> None:
@@ -382,7 +387,9 @@ def normalize_capture(raw: str, width: int) -> str:
     out: list[str] = []
     blank = "\x1b[0m" + (" " * width)
     for line in lines:
-        # Drop non-SGR CSI so the renderer only sees text and colors.
+        # Drop OSC (hyperlinks) and non-SGR CSI so textimg only sees
+        # text and colors.
+        line = OSC_RE.sub("", line)
         line = CSI_OTHER_RE.sub(
             lambda m: m.group(0) if m.group(0).endswith("m") else "",
             line,
@@ -476,9 +483,144 @@ def render_png(ansi_path: Path, png_path: Path, textimg: Path, font: Path) -> No
     subprocess.run(argv, check=True, input=ansi_path.read_bytes())
 
 
+def git_identity(real_git: str) -> tuple[str, str]:
+    name = subprocess.run(
+        [real_git, "config", "--get", "user.name"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    email = subprocess.run(
+        [real_git, "config", "--get", "user.email"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    return name, email
+
+
+def make_sl_fixture(repo: Path, home: Path, name: str, email: str) -> None:
+    """Branched Sapling repo so the smartlog graph has a fork.
+
+    @ sits on the right-hand stack; `side` is a sibling draft:
+
+        @  tip
+        o  right
+        | o  side
+        |/
+        o  root
+    """
+    repo.mkdir(parents=True)
+    home.mkdir(parents=True)
+    conf_dir = home / "Library" / "Preferences" / "sapling"
+    conf_dir.mkdir(parents=True)
+    (conf_dir / "sapling.conf").write_text(
+        "[ui]\n"
+        f"username = {name} <{email}>\n"
+        "color = never\n"
+        "paginate = never\n"
+        "[fsmonitor]\n"
+        "mode = off\n"
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+
+    def sl(*args: str) -> str:
+        result = subprocess.run(
+            ["sl", "--cwd", str(repo), *args],
+            check=True,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        return result.stdout
+
+    sl("init", "-q")
+
+    def commit(filename: str, message: str, date: str) -> None:
+        (repo / filename).write_text(message + "\n")
+        sl("addremove")
+        sl("commit", "-m", message, "--date", date)
+
+    commit("root.txt", "root", "3 days ago")
+    commit("side.txt", "side", "2 days ago")
+    root = sl("log", "-r", ".^", "-T", "{node}\\n").strip()
+    sl("goto", "-q", root)
+    commit("right.txt", "right", "1 day ago")
+    commit("tip.txt", "tip", "2 hours ago")
+
+
+def shot_smartlog(tmux: str, real_git: str) -> None:
+    session = f"{SESSION_PREFIX}-sl-{os.getpid()}"
+    subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+    name, email = git_identity(real_git)
+    with tempfile.TemporaryDirectory(prefix="live-diff-sl-shot-") as tmp_s:
+        tmp = Path(tmp_s)
+        repo = tmp / "repo"
+        home = tmp / "home"
+        make_sl_fixture(repo, home, name, email)
+        # live-diff must see the same HOME so `sl smartlog` uses this
+        # repo's commits and the fixture username, not another config.
+        argv = [
+            tmux,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-x",
+            str(COLS),
+            "-y",
+            str(ROWS),
+            "-c",
+            str(repo),
+            "--",
+            "env",
+            f"HOME={home}",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            str(BINARY),
+            "--sl",
+            "-n",
+            "60",
+        ]
+        print(f"starting tmux session {session}")
+        run(argv)
+        try:
+            time.sleep(2.0)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session, "--", "t"],
+                check=True,
+            )
+            time.sleep(0.8)
+            raw = tmux_capture(session)
+            plain = plain_text(raw)
+            if "tip" not in plain:
+                die(f"smartlog view did not show tip\n{plain}")
+            if "side" not in plain and "right" not in plain:
+                die(f"smartlog view did not show the fork\n{plain}")
+            if "@" not in plain and "o" not in plain:
+                die(f"smartlog graph missing\n{plain}")
+            ansi = tmp / "smartlog.ansi"
+            ansi.write_text(normalize_capture(raw, COLS))
+            font = tmp / "Monaco-halfem.ttf"
+            write_half_em_monaco(font)
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
+            png = OUT_DIR / "smartlog.png"
+            print(f"writing {png}")
+            render_png(ansi, png, TEXTIMG, font)
+        finally:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+            )
+
+
 def main() -> None:
     tmux = require_tool("tmux")
     require_tool("dotslash")
+    require_tool("sl")
     real_git = require_tool("git")
     if not TEXTIMG.is_file():
         die(f"missing {TEXTIMG}")
@@ -603,8 +745,20 @@ def main() -> None:
                 capture_output=True,
             )
 
+    shot_smartlog(tmux, real_git)
     print("done")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "smartlog":
+        require_tool("tmux")
+        require_tool("dotslash")
+        require_tool("sl")
+        real_git = require_tool("git")
+        if not TEXTIMG.is_file():
+            die(f"missing {TEXTIMG}")
+        build_binary()
+        shot_smartlog(require_tool("tmux"), real_git)
+        print("done")
+    else:
+        main()
