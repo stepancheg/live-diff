@@ -14,6 +14,7 @@ mod render;
 mod repo;
 mod search;
 mod size;
+mod smartlog;
 mod terminal;
 mod terminal_bg;
 mod terminal_guard;

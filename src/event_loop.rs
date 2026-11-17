@@ -32,12 +32,9 @@ use crate::render::ScrollAnchor;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::step_context;
 use crate::repo::sl_smartlog::SmartlogView;
-use crate::repo::sl_smartlog::commit_header_row;
 use crate::repo::sl_smartlog::current_commit_index;
 use crate::repo::sl_smartlog::fetch_smartlog;
 use crate::repo::sl_smartlog::find_commit_index;
-use crate::repo::sl_smartlog::smartlog_lines;
-use crate::repo::sl_smartlog::unix_now;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
@@ -52,6 +49,9 @@ use crate::search::state::Search;
 use crate::search::state::is_case_mode_status;
 use crate::search::state::status_after_output;
 use crate::size::Size;
+use crate::smartlog::commit_header_row;
+use crate::smartlog::smartlog_lines;
+use crate::smartlog::unix_now;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
 use crate::terminal::line::fold_case;
@@ -968,6 +968,7 @@ impl EventLoop {
             Some(self.smartlog_sel),
             unix_now(),
             self.help_renderer.terminal_bg(),
+            self.size.width,
         );
         let hint = "Enter: open";
         if !force {

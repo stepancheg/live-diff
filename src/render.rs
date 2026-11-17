@@ -1101,6 +1101,8 @@ struct VisualRow {
     width: Width,
     /// True when this row continues the same logical line after a width wrap.
     soft_wrap: bool,
+    /// Erase to the end of this screen row with the current background.
+    fill_eol: bool,
 }
 
 struct Piece {
@@ -1466,6 +1468,23 @@ fn write_one_line(
             }
             out.write_all(piece.text.as_bytes())?;
         }
+        // Skip EL on a full-width row that soft-wraps: the terminal
+        // cursor may sit on the right margin, and the next row's text
+        // continues without a newline.
+        let next_soft = match rows.get(i + 1) {
+            Some(next) => next.soft_wrap && row.width == terminal_width,
+            None => false,
+        };
+        if row.fill_eol {
+            if !next_soft {
+                // Close the link so EL cannot extend an OSC 8 run.
+                if open_link.is_some() {
+                    out.write_all(OSC8_CLOSE)?;
+                    open_link = None;
+                }
+                out.write_all(b"\x1b[K")?;
+            }
+        }
     }
     if open_link.is_some() {
         out.write_all(OSC8_CLOSE)?;
@@ -1612,6 +1631,7 @@ fn line_visual_rows(
                     pieces,
                     width: col,
                     soft_wrap,
+                    fill_eol: line.fill_eol,
                 });
                 pieces = Vec::new();
                 col = Width(0);
@@ -1640,6 +1660,7 @@ fn line_visual_rows(
             pieces,
             width: col,
             soft_wrap,
+            fill_eol: line.fill_eol,
         });
     }
     rows

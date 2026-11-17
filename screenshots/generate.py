@@ -43,6 +43,9 @@ TEXTIMG = OUT_DIR / "textimg"
 # is 1229/2048 em (0.6), so its outlines overlap that grid. We rewrite
 # unitsPerEm to 2458 (= 1229*2) so the advance is exactly half an em.
 MONACO_SRC = Path("/System/Library/Fonts/Monaco.ttf")
+# Menlo has the arc box-drawing corners (╭╮╰╯) that Monaco lacks.
+# Smartlog shots use Menlo so those glyphs are not .notdef boxes.
+MENLO_SRC = Path("/System/Library/Fonts/Menlo.ttc")
 # Larger than 14 so the PNG is readable. Spacing ratio does not depend
 # on this value.
 FONT_SIZE = 28
@@ -462,6 +465,37 @@ def write_half_em_monaco(dst: Path) -> None:
     dst.write_bytes(data)
 
 
+def write_half_em_menlo(dst: Path) -> None:
+    """Copy Menlo Regular (TTC face 0) and set unitsPerEm to 2*advance.
+
+    textimg steps by fontSize/2. Menlo's advance is 1233/2048 em, so
+    unitsPerEm 2466 makes that advance exactly half an em. Face 0 is
+    Menlo Regular and includes U+256D..U+2570.
+    """
+    if not MENLO_SRC.is_file():
+        die(f"missing {MENLO_SRC}")
+    data = bytearray(MENLO_SRC.read_bytes())
+    if data[:4] != b"ttcf":
+        die(f"{MENLO_SRC} is not a TTC")
+    num_fonts = int.from_bytes(data[8:12], "big")
+    if num_fonts < 1:
+        die(f"{MENLO_SRC} has no faces")
+    face0 = int.from_bytes(data[12:16], "big")
+    num_tables = int.from_bytes(data[face0 + 4 : face0 + 6], "big")
+    head_off = None
+    for i in range(num_tables):
+        off = face0 + 12 + i * 16
+        tag = bytes(data[off : off + 4])
+        toff = int.from_bytes(data[off + 8 : off + 12], "big")
+        if tag == b"head":
+            head_off = toff
+            break
+    if head_off is None:
+        die("Menlo face 0 has no head table")
+    data[head_off + 18 : head_off + 20] = (2466).to_bytes(2, "big")
+    dst.write_bytes(data)
+
+
 def render_png(ansi_path: Path, png_path: Path, textimg: Path, font: Path) -> None:
     # textimg reads the ANSI text from stdin when no text argument
     # is given. It ignores SGR 1; the capture rewrite turns bold
@@ -552,6 +586,29 @@ def make_sl_fixture(repo: Path, home: Path, name: str, email: str) -> None:
     commit("tip.txt", "tip", "2 hours ago")
 
 
+def _smartlog_selection_below_tip(raw: str) -> bool:
+    """True when a non-tip commit row carries the row-highlight bg.
+
+    `@` is the first commit. Its header line contains `@`. A selected
+    row is painted with SGR 48;5;8 (the dark row highlight). The status
+    bar uses that bg too, but it has no `@` / commit hash.
+    """
+    tip_highlighted = False
+    other_highlighted = False
+    for line in raw.split("\n"):
+        cleaned = OSC_RE.sub("", line)
+        if "48;5;8" not in cleaned and "48;5;7" not in cleaned:
+            continue
+        text = plain_text(cleaned)
+        if text.startswith("Enter:") or "Top" in text or "Bot" in text:
+            continue
+        if "@" in text:
+            tip_highlighted = True
+        elif "o" in text:
+            other_highlighted = True
+    return other_highlighted and not tip_highlighted
+
+
 def shot_smartlog(tmux: str, real_git: str) -> None:
     session = f"{SESSION_PREFIX}-sl-{os.getpid()}"
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
@@ -594,6 +651,13 @@ def shot_smartlog(tmux: str, real_git: str) -> None:
                 check=True,
             )
             time.sleep(0.8)
+            # Default selection is `@` (tip). Move to the next commit
+            # so the highlight is not on the newest commit.
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session, "--", "j"],
+                check=True,
+            )
+            time.sleep(0.3)
             raw = tmux_capture(session)
             plain = plain_text(raw)
             if "tip" not in plain:
@@ -602,10 +666,16 @@ def shot_smartlog(tmux: str, real_git: str) -> None:
                 die(f"smartlog view did not show the fork\n{plain}")
             if "@" not in plain and "o" not in plain:
                 die(f"smartlog graph missing\n{plain}")
+            if "\u2502" not in plain and "\u256f" not in plain:
+                die(f"smartlog graph is not box-drawing\n{plain}")
+            # Selection must sit on a commit below `@`, not the tip.
+            if not _smartlog_selection_below_tip(raw):
+                die(f"smartlog selection is still on the tip\n{plain}")
             ansi = tmp / "smartlog.ansi"
             ansi.write_text(normalize_capture(raw, COLS))
-            font = tmp / "Monaco-halfem.ttf"
-            write_half_em_monaco(font)
+            # Monaco omits ╭╮╰╯; Menlo draws the Sapling arc corners.
+            font = tmp / "Menlo-halfem.ttc"
+            write_half_em_menlo(font)
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             png = OUT_DIR / "smartlog.png"
             print(f"writing {png}")

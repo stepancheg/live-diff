@@ -1,14 +1,5 @@
 use std::process::Command;
 use std::str;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-
-use unicode_width::UnicodeWidthStr;
-
-use crate::terminal::color::TerminalColor;
-use crate::terminal::line::Line;
-use crate::terminal::style::Style;
-use crate::terminal_bg::TerminalBg;
 
 /// Null parent hash emitted by `p1node` / `p2node` when that parent
 /// does not exist.
@@ -88,6 +79,10 @@ pub(crate) fn sl_smartlog_command() -> Vec<String> {
     cmd.push(String::from("sl"));
     cmd.push(String::from("--color=never"));
     cmd.push(String::from("--pager=never"));
+    // Box-drawing graph (`│`, `├─╯`), not the ASCII `|` `/` renderer.
+    // Overrides a user or repo `experimental.graph.renderer=ascii`.
+    cmd.push(String::from("--config"));
+    cmd.push(String::from("experimental.graph.renderer=lines"));
     cmd.push(String::from("smartlog"));
     cmd.push(String::from("-T"));
     cmd.push(String::from(
@@ -350,235 +345,6 @@ fn github_pr_number(value: &serde_json::Value) -> anyhow::Result<Option<u64>> {
     }
 }
 
-/// Paint smartlog rows in the `sl sl` layout: graph, then hash, age,
-/// author, bookmarks, and `gh#N`, with the description on the next row.
-pub(crate) fn smartlog_lines(
-    view: &SmartlogView,
-    selected: Option<usize>,
-    now_unix: i64,
-    terminal_bg: TerminalBg,
-) -> Vec<Line> {
-    let mut lines = Vec::new();
-    for row in &view.rows {
-        let commit = match row.commit {
-            Some(index) => view.commits.get(index),
-            None => None,
-        };
-        let selected_row = match (selected, row.commit) {
-            (Some(sel), Some(index)) => sel == index,
-            _ => false,
-        };
-        let phase_style = match commit {
-            Some(c) => phase_style(c, selected_row, terminal_bg),
-            None => plain_row_style(selected_row, terminal_bg),
-        };
-        let mut line = Line::new();
-        match row.kind {
-            SmartlogRowKind::Header => {
-                let Some(c) = commit else {
-                    continue;
-                };
-                line.push_styled(&row.graph, phase_style);
-                line.push_styled(&short_node(&c.node), phase_style);
-                let age = format_age(c.date_unix, now_unix);
-                let mut meta = Style::plain();
-                meta.dim = true;
-                apply_row_bg(&mut meta, selected_row, terminal_bg);
-                if !age.is_empty() {
-                    line.push_styled("  ", meta);
-                    line.push_styled(&age, meta);
-                }
-                if !c.author.is_empty() {
-                    line.push_styled("  ", meta);
-                    line.push_styled(&c.author, meta);
-                }
-                let mut book = Style::plain();
-                book.fg = Some(TerminalColor::Cyan);
-                apply_row_bg(&mut book, selected_row, terminal_bg);
-                for name in &c.bookmarks {
-                    line.push_styled("  ", book);
-                    line.push_styled(name, book);
-                }
-                if let Some(pr) = c.github_pr {
-                    // Spaces stay unlinked and not underlined; only `#N` is.
-                    line.push_styled("  ", book);
-                    let mut pr_style = book;
-                    pr_style.underline = true;
-                    let label = format!("#{pr}");
-                    match &view.forge {
-                        Some(forge) => {
-                            line.push_linked(&label, pr_style, &forge.pull_url(pr));
-                        }
-                        None => {
-                            line.push_styled(&label, pr_style);
-                        }
-                    }
-                }
-            }
-            SmartlogRowKind::Desc => {
-                let Some(c) = commit else {
-                    continue;
-                };
-                let text_col = UnicodeWidthStr::width(row_header_graph(view, c, row).as_str());
-                let padded = pad_graph(&row.graph, text_col);
-                let mut graph_style = Style::plain();
-                apply_row_bg(&mut graph_style, selected_row, terminal_bg);
-                line.push_styled(&padded, graph_style);
-                let mut desc_style = Style::plain();
-                if c.current {
-                    desc_style.bold = true;
-                }
-                apply_row_bg(&mut desc_style, selected_row, terminal_bg);
-                line.push_styled(&c.desc, desc_style);
-            }
-            SmartlogRowKind::Edge => {
-                let mut graph_style = Style::plain();
-                apply_row_bg(&mut graph_style, selected_row, terminal_bg);
-                line.push_styled(&row.graph, graph_style);
-            }
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-fn row_header_graph(view: &SmartlogView, commit: &SmartlogCommit, _row: &SmartlogRow) -> String {
-    // The header row for this commit holds the graph width that text
-    // is aligned to.
-    for row in &view.rows {
-        if row.kind != SmartlogRowKind::Header {
-            continue;
-        }
-        if let Some(index) = row.commit {
-            if let Some(c) = view.commits.get(index) {
-                if c.node == commit.node {
-                    return row.graph.clone();
-                }
-            }
-        }
-    }
-    String::new()
-}
-
-fn pad_graph(graph: &str, text_col: usize) -> String {
-    let width = UnicodeWidthStr::width(graph);
-    if width >= text_col {
-        return graph.to_owned();
-    }
-    let mut s = String::from(graph);
-    let pad = text_col.saturating_sub(width);
-    for _ in 0..pad {
-        s.push(' ');
-    }
-    s
-}
-
-fn short_node(node: &str) -> String {
-    // `sl sl` uses shortest(node, 10). Ten hex digits is that minimum
-    // and is unique in any small fixture; live repos may need more, but
-    // ten matches the usual smartlog hash.
-    let mut s = String::new();
-    for (i, ch) in node.chars().enumerate() {
-        if i >= 10 {
-            break;
-        }
-        s.push(ch);
-    }
-    s
-}
-
-fn format_age(ts: i64, now: i64) -> String {
-    if ts <= 0 {
-        return String::new();
-    }
-    if now < ts {
-        return String::from("in the future");
-    }
-    let secs = now - ts;
-    if secs < 60 {
-        return plural(secs, "second");
-    }
-    if secs < 3600 {
-        return plural(secs / 60, "minute");
-    }
-    if secs < 48 * 3600 {
-        return plural(secs / 3600, "hour");
-    }
-    if secs < 14 * 86400 {
-        return plural(secs / 86400, "day");
-    }
-    // Fallback calendar date in UTC, YYYY-MM-DD.
-    format_utc_date(ts)
-}
-
-fn plural(n: i64, unit: &str) -> String {
-    if n == 1 {
-        return format!("1 {unit} ago");
-    }
-    format!("{n} {unit}s ago")
-}
-
-fn format_utc_date(ts: i64) -> String {
-    // Civil date from unix days, no chrono dependency.
-    let days = ts.div_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Howard Hinnant civil_from_days.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
-}
-
-fn phase_style(commit: &SmartlogCommit, selected: bool, terminal_bg: TerminalBg) -> Style {
-    let mut style = Style::plain();
-    style.fg = Some(match commit.phase.as_str() {
-        "public" => TerminalColor::Green,
-        "secret" => TerminalColor::Magenta,
-        _ => TerminalColor::Yellow,
-    });
-    if commit.current {
-        style.bold = true;
-    }
-    apply_row_bg(&mut style, selected, terminal_bg);
-    style
-}
-
-fn plain_row_style(selected: bool, terminal_bg: TerminalBg) -> Style {
-    let mut style = Style::plain();
-    apply_row_bg(&mut style, selected, terminal_bg);
-    style
-}
-
-fn apply_row_bg(style: &mut Style, selected: bool, terminal_bg: TerminalBg) {
-    if selected {
-        style.bg = Some(terminal_bg.row_highlight());
-    }
-}
-
-/// Row index of the header line for `commit`.
-pub(crate) fn commit_header_row(view: &SmartlogView, commit: usize) -> usize {
-    for (i, row) in view.rows.iter().enumerate() {
-        if row.kind != SmartlogRowKind::Header {
-            continue;
-        }
-        if row.commit == Some(commit) {
-            return i;
-        }
-    }
-    0
-}
-
 /// Index of the current commit (`@`), if it is in the view.
 pub(crate) fn current_commit_index(view: &SmartlogView) -> Option<usize> {
     view.commits.iter().position(|c| c.current)
@@ -603,13 +369,6 @@ pub(crate) fn find_commit_index(view: &SmartlogView, rev: &str) -> Option<usize>
         }
     }
     found
-}
-
-pub(crate) fn unix_now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => 0,
-    }
 }
 
 #[cfg(test)]
@@ -666,22 +425,14 @@ mod tests {
 
         let bytes = repo.run_ok(&sl_smartlog_command());
         let view = crate::repo::sl_smartlog::parse_smartlog_view(&bytes).unwrap();
-        let painted = crate::repo::sl_smartlog::smartlog_lines(
-            &view,
-            None,
-            crate::repo::sl_smartlog::unix_now(),
-            crate::terminal_bg::TerminalBg::Dark,
-        );
-        let text: String = painted
+        let graph: String = view
+            .rows
             .iter()
-            .map(|line| line.plain_text())
-            .collect::<Vec<String>>()
+            .map(|row| row.graph.as_str())
+            .collect::<Vec<&str>>()
             .join("\n");
         // Same fork Sapling draws: the side commit joins with ├─╯.
-        assert_eq!(true, text.contains("├─╯"));
-        assert_eq!(true, text.contains("left"));
-        assert_eq!(true, text.contains("right"));
-        assert_eq!(true, text.contains("root"));
+        assert_eq!(true, graph.contains("├─╯"));
         let commits = parse_smartlog(&bytes).unwrap();
         let mut by_desc: Vec<(String, String, Vec<String>)> = commits
             .iter()
@@ -780,55 +531,6 @@ mod tests {
             }
             .pull_url(12)
         );
-    }
-
-    #[test]
-    fn test_smartlog_pr_label_is_linked_hash_number() {
-        use crate::repo::sl_smartlog::Forge;
-        use crate::repo::sl_smartlog::SmartlogCommit;
-        use crate::repo::sl_smartlog::SmartlogRow;
-        use crate::repo::sl_smartlog::SmartlogRowKind;
-        use crate::repo::sl_smartlog::SmartlogView;
-        use crate::repo::sl_smartlog::smartlog_lines;
-        use crate::terminal_bg::TerminalBg;
-        let view = SmartlogView {
-            commits: vec![SmartlogCommit {
-                node: String::from("abc"),
-                parents: Vec::new(),
-                phase: String::from("draft"),
-                bookmarks: Vec::new(),
-                desc: String::from("d"),
-                github_pr: Some(2032111),
-                author: String::from("t"),
-                date_unix: 0,
-                current: false,
-            }],
-            rows: vec![SmartlogRow {
-                commit: Some(0),
-                graph: String::from("o  "),
-                kind: SmartlogRowKind::Header,
-            }],
-            forge: Some(Forge::Origin {
-                org: String::from("spacexsi"),
-                name: String::from("xai"),
-            }),
-        };
-        let lines = smartlog_lines(&view, None, 0, TerminalBg::Dark);
-        let text = lines[0].plain_text();
-        assert_eq!(true, text.contains("#2032111"));
-        assert_eq!(false, text.contains("gh#"));
-        let linked = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.link.is_some())
-            .expect("pr span is a link");
-        assert_eq!(
-            Some(String::from(
-                "https://cursor.com/codebase/spacexsi/xai/pull/2032111"
-            )),
-            linked.link.clone()
-        );
-        assert_eq!("#2032111", linked.content.as_ref().as_str());
     }
 
     fn sl_commit(repo: &TestRepo, message: &str) -> String {
