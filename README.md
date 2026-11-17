@@ -68,6 +68,7 @@ or `bin/live-diff`
 | `/` `?` `n` `N` | Search |
 | `s` | Diff stat (Enter or `s` opens the file, Esc returns) |
 | `d` | Diff mode: default, `-c .`, or `-r prev` |
+| `t` | Smartlog (Enter shows that commit, Esc returns) |
 | `u` / `U` | Decrease / increase context |
 | `mx` / `'x` | Set / go to mark |
 

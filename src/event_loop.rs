@@ -18,6 +18,8 @@ use crate::capture::CaptureSpec;
 use crate::capture::DIFF_VIEW_KINDS;
 use crate::capture::DiffViewKind;
 use crate::diff::DiffOutput;
+use crate::diff::commit_description_lines;
+use crate::diff::file_list_description_rows;
 use crate::diff::file_list_lines;
 use crate::height::Height;
 use crate::help::help_lines;
@@ -29,6 +31,13 @@ use crate::render::Renderer;
 use crate::render::ScrollAnchor;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::step_context;
+use crate::repo::sl_smartlog::SmartlogView;
+use crate::repo::sl_smartlog::commit_header_row;
+use crate::repo::sl_smartlog::current_commit_index;
+use crate::repo::sl_smartlog::fetch_smartlog;
+use crate::repo::sl_smartlog::find_commit_index;
+use crate::repo::sl_smartlog::smartlog_lines;
+use crate::repo::sl_smartlog::unix_now;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
@@ -63,6 +72,7 @@ enum HelpBack {
     Output,
     Files,
     DiffSelect,
+    Smartlog,
 }
 
 enum Mode {
@@ -75,6 +85,8 @@ enum Mode {
     Files,
     /// Diff-mode menu (`d`): default, `-c .`, `-r prev`.
     DiffSelect,
+    /// Sapling smartlog (`t`).
+    Smartlog,
     Prompt(Prompt),
     /// Waiting for the option letter after `-`.
     Dash,
@@ -104,6 +116,13 @@ pub(crate) struct EventLoop {
     tool: Option<DiffTool>,
     /// Selected row in the diff-mode menu.
     diff_mode_index: usize,
+    /// Latest smartlog snapshot for the `t` view.
+    smartlog: Option<SmartlogView>,
+    /// Selected commit in the smartlog view.
+    smartlog_sel: usize,
+    /// True when smartlog was opened from the diffstat page, so Esc
+    /// returns there.
+    smartlog_from_files: bool,
 }
 
 impl EventLoop {
@@ -129,6 +148,9 @@ impl EventLoop {
             spec,
             tool,
             diff_mode_index: 0,
+            smartlog: None,
+            smartlog_sel: 0,
+            smartlog_from_files: false,
         }
     }
 
@@ -206,7 +228,7 @@ impl EventLoop {
         self.renderer.update_size(self.size);
         self.help_renderer.update_size(self.size);
         match self.mode {
-            Mode::Help { .. } | Mode::Files | Mode::DiffSelect => {
+            Mode::Help { .. } | Mode::Files | Mode::DiffSelect | Mode::Smartlog => {
                 self.help_renderer.redraw(&mut io::stdout())?;
             }
             _ => {
@@ -250,7 +272,7 @@ impl EventLoop {
             self.renderer.set_status_label(label);
         }
         match self.mode {
-            Mode::Help { .. } | Mode::DiffSelect => {}
+            Mode::Help { .. } | Mode::DiffSelect | Mode::Smartlog => {}
             // In-place refresh. `draw` skips the terminal write when the
             // visible list is unchanged, so a text selection survives.
             Mode::Files => self.paint_file_list(false)?,
@@ -273,6 +295,7 @@ impl EventLoop {
             Mode::Help { .. } => self.on_help_key(key),
             Mode::Files => self.on_files_key(key),
             Mode::DiffSelect => self.on_diff_select_key(key),
+            Mode::Smartlog => self.on_smartlog_key(key),
             Mode::Output => self.on_output_key(key),
         }
     }
@@ -435,12 +458,10 @@ impl EventLoop {
             _ => 0,
         };
         self.mode = Mode::Files;
-        // Start with the current file at the top of the list.
+        // Show the commit description (when present) from the top.
+        // paint keeps the selected file on screen.
         self.help_renderer.scroll_top();
-        // Screen still shows the diff; the redraw below paints the list.
-        self.paint_file_list(false)?;
-        self.help_renderer.scroll_to_line(self.file_list_index);
-        self.help_renderer.redraw(&mut io::stdout())?;
+        self.paint_file_list(true)?;
         Ok(KeyResult::Continue)
     }
 
@@ -466,6 +487,10 @@ impl EventLoop {
             HelpBack::DiffSelect => {
                 self.mode = Mode::DiffSelect;
                 self.paint_diff_select(true)?;
+            }
+            HelpBack::Smartlog => {
+                self.mode = Mode::Smartlog;
+                self.paint_smartlog(true)?;
             }
             HelpBack::Output => {
                 self.mode = Mode::Output;
@@ -501,6 +526,18 @@ impl EventLoop {
         self.paint_file_list(false)
     }
 
+    /// Commit message for the stat page, only in `-c` / show-commit mode.
+    fn stat_commit_description(&self) -> Vec<String> {
+        let commit_mode = match self.spec.lock() {
+            Ok(spec) => matches!(*spec, CaptureSpec::Commit { .. }),
+            Err(err) => matches!(*err.into_inner(), CaptureSpec::Commit { .. }),
+        };
+        if !commit_mode {
+            return Vec::new();
+        }
+        commit_description_lines(&self.output.preamble_lines())
+    }
+
     /// Build the stat page and paint it.
     ///
     /// `force` must be set when the diff (or another view) was just
@@ -517,12 +554,14 @@ impl EventLoop {
         } else if self.file_list_index >= n {
             self.file_list_index = n - 1;
         }
+        let description = self.stat_commit_description();
         let lines = file_list_lines(
             &files,
             untracked,
             self.file_list_index,
             self.help_renderer.terminal_bg(),
             self.size.width,
+            &description,
         );
         let hint = if self.file_list_index >= files.len() {
             if !untracked.is_empty() {
@@ -545,7 +584,8 @@ impl EventLoop {
         self.help_renderer.set_lines(lines);
         self.help_renderer
             .set_status_label(Some(String::from(hint)));
-        self.help_renderer.ensure_line_visible(self.file_list_index);
+        let row = file_list_description_rows(&description).saturating_add(self.file_list_index);
+        self.help_renderer.ensure_line_visible(row);
         if force {
             self.help_renderer.redraw(&mut io::stdout())?;
         } else {
@@ -654,6 +694,7 @@ impl EventLoop {
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
+            KeyAction::Smartlog => self.open_smartlog(),
             KeyAction::Dash
             | KeyAction::DiffMode
             | KeyAction::SearchForward
@@ -818,6 +859,253 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
+            | KeyAction::Smartlog
+            | KeyAction::Dash
+            | KeyAction::SearchForward
+            | KeyAction::SearchBackward
+            | KeyAction::SearchNext
+            | KeyAction::SearchPrev
+            | KeyAction::SetMark
+            | KeyAction::GotoMark => Ok(KeyResult::Continue),
+        }
+    }
+
+    /// Commit to highlight when the tree opens. In `-c` mode that is
+    /// the commit being viewed; a refresh of an open tree keeps the
+    /// same node when it is still present.
+    fn smartlog_open_selection(&self, view: &SmartlogView) -> usize {
+        if matches!(self.mode, Mode::Smartlog) {
+            if let Some(prev) = &self.smartlog {
+                if let Some(commit) = prev.commits.get(self.smartlog_sel) {
+                    if let Some(i) = find_commit_index(view, &commit.node) {
+                        return i;
+                    }
+                }
+            }
+        }
+        let rev = match self.spec.lock() {
+            Ok(spec) => match &*spec {
+                CaptureSpec::Commit { commit, .. } => Some(commit.clone()),
+                _ => None,
+            },
+            Err(err) => match &*err.into_inner() {
+                CaptureSpec::Commit { commit, .. } => Some(commit.clone()),
+                _ => None,
+            },
+        };
+        if let Some(rev) = rev {
+            if let Some(i) = find_commit_index(view, &rev) {
+                return i;
+            }
+        }
+        current_commit_index(view).unwrap_or(0)
+    }
+
+    fn open_smartlog(&mut self) -> anyhow::Result<KeyResult> {
+        let from_files = match self.mode {
+            Mode::Files => true,
+            Mode::Smartlog => self.smartlog_from_files,
+            _ => false,
+        };
+        if self.tool != Some(DiffTool::Sl) {
+            let msg = String::from("smartlog requires sl");
+            if from_files {
+                self.help_renderer.set_status_label(Some(msg));
+                self.help_renderer.redraw(&mut io::stdout())?;
+            } else {
+                self.renderer.set_status_label(Some(msg));
+                self.renderer.redraw(&mut io::stdout())?;
+            }
+            return Ok(KeyResult::Continue);
+        }
+        match fetch_smartlog() {
+            Ok(view) => {
+                self.smartlog_from_files = from_files;
+                self.smartlog_sel = self.smartlog_open_selection(&view);
+                self.smartlog = Some(view);
+                self.mode = Mode::Smartlog;
+                self.paint_smartlog(true)?;
+                // Put the selected commit's header at the top.
+                if let Some(view) = &self.smartlog {
+                    let row = commit_header_row(view, self.smartlog_sel);
+                    self.help_renderer.scroll_to_line(row);
+                    self.help_renderer.redraw(&mut io::stdout())?;
+                }
+                Ok(KeyResult::Continue)
+            }
+            Err(err) => {
+                let msg = format!("smartlog: {err}");
+                if from_files {
+                    self.help_renderer.set_status_label(Some(msg));
+                    self.help_renderer.redraw(&mut io::stdout())?;
+                } else {
+                    self.renderer.set_status_label(Some(msg));
+                    self.renderer.redraw(&mut io::stdout())?;
+                }
+                Ok(KeyResult::Continue)
+            }
+        }
+    }
+
+    fn close_smartlog(&mut self) -> anyhow::Result<KeyResult> {
+        if self.smartlog_from_files {
+            self.smartlog_from_files = false;
+            self.mode = Mode::Files;
+            self.paint_file_list(true)?;
+        } else {
+            self.mode = Mode::Output;
+            self.renderer.redraw(&mut io::stdout())?;
+        }
+        Ok(KeyResult::Continue)
+    }
+
+    fn paint_smartlog(&mut self, force: bool) -> anyhow::Result<()> {
+        let Some(view) = &self.smartlog else {
+            return Ok(());
+        };
+        let lines = smartlog_lines(
+            view,
+            Some(self.smartlog_sel),
+            unix_now(),
+            self.help_renderer.terminal_bg(),
+        );
+        let hint = "Enter: open";
+        if !force {
+            let same_lines = self.help_renderer.lines() == lines.as_slice();
+            let same_label = self.help_renderer.status_label() == Some(hint);
+            if same_lines {
+                if same_label {
+                    return Ok(());
+                }
+            }
+        }
+        self.help_renderer.set_lines(lines);
+        self.help_renderer
+            .set_status_label(Some(String::from(hint)));
+        let row = commit_header_row(view, self.smartlog_sel);
+        self.help_renderer.ensure_line_visible(row);
+        if force {
+            self.help_renderer.redraw(&mut io::stdout())?;
+        } else {
+            self.help_renderer.draw(&mut io::stdout())?;
+        }
+        Ok(())
+    }
+
+    fn move_smartlog_sel(&mut self, target: usize) -> anyhow::Result<()> {
+        let Some(view) = &self.smartlog else {
+            return Ok(());
+        };
+        let last = view.commits.len().saturating_sub(1);
+        self.smartlog_sel = target.min(last);
+        self.paint_smartlog(false)
+    }
+
+    fn apply_smartlog_selection(&mut self) -> anyhow::Result<KeyResult> {
+        let Some(view) = &self.smartlog else {
+            return self.close_smartlog();
+        };
+        let Some(commit) = view.commits.get(self.smartlog_sel) else {
+            return self.close_smartlog();
+        };
+        let node = commit.node.clone();
+        let is_current = commit.current;
+        let Some(tool) = self.tool else {
+            return self.close_smartlog();
+        };
+        {
+            let mut spec = self.spec.lock().unwrap();
+            // `@` is the working-copy parent: show the default working
+            // tree diff, not `show` of that commit.
+            if is_current {
+                *spec = CaptureSpec::for_kind(tool, DiffViewKind::Default);
+            } else {
+                *spec = CaptureSpec::Commit { tool, commit: node };
+            }
+        }
+        self.sync_status_mode();
+        self.smartlog_from_files = false;
+        self.mode = Mode::Output;
+        self.search.clear_match();
+        self.search.apply_highlight(&mut self.renderer);
+        self.renderer.scroll_top();
+        self.renderer.set_status_label(None);
+        self.renderer.redraw(&mut io::stdout())?;
+        Ok(KeyResult::Refresh)
+    }
+
+    fn on_smartlog_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(KeyResult::Continue);
+        }
+        if key.code == KeyCode::Enter {
+            return self.apply_smartlog_selection();
+        }
+        let Some(action) = key_action(&key) else {
+            return Ok(KeyResult::Continue);
+        };
+        let n = match &self.smartlog {
+            Some(view) => view.commits.len(),
+            None => 0,
+        };
+        let page = list_page_size(self.size);
+        match action {
+            KeyAction::Quit => Ok(KeyResult::Quit),
+            KeyAction::Smartlog | KeyAction::DismissMessage => self.close_smartlog(),
+            KeyAction::Help => {
+                self.mode = Mode::Help {
+                    back: HelpBack::Smartlog,
+                };
+                self.help_renderer.set_lines(help_lines());
+                self.help_renderer.set_status_label(None);
+                self.help_renderer.scroll_top();
+                self.help_renderer.redraw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::Refresh => {
+                // Re-query the tree.
+                self.open_smartlog()
+            }
+            KeyAction::ContextLess | KeyAction::ContextMore => {
+                let result = self.change_context(action)?;
+                self.mode = Mode::Smartlog;
+                self.paint_smartlog(true)?;
+                Ok(result)
+            }
+            KeyAction::ScrollDown => {
+                let next = self.smartlog_sel.saturating_add(1);
+                self.move_smartlog_sel(next)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollUp => {
+                let prev = self.smartlog_sel.saturating_sub(1);
+                self.move_smartlog_sel(prev)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollTop => {
+                self.move_smartlog_sel(0)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollBottom => {
+                self.move_smartlog_sel(n.saturating_sub(1))?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollPageDown => {
+                let next = self.smartlog_sel.saturating_add(page);
+                self.move_smartlog_sel(next)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollPageUp => {
+                let prev = self.smartlog_sel.saturating_sub(page);
+                self.move_smartlog_sel(prev)?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::Redraw => {
+                self.help_renderer.redraw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::FileList
+            | KeyAction::DiffMode
             | KeyAction::Dash
             | KeyAction::SearchForward
             | KeyAction::SearchBackward
@@ -883,13 +1171,21 @@ impl EventLoop {
                         self.paint_diff_select(true)?;
                         Ok(result)
                     }
+                    HelpBack::Smartlog => {
+                        let result = self.change_context(action)?;
+                        self.mode = Mode::Smartlog;
+                        self.paint_smartlog(true)?;
+                        Ok(result)
+                    }
                     HelpBack::Output => {
                         self.mode = Mode::Output;
                         self.change_context(action)
                     }
                 }
             }
-            KeyAction::FileList | KeyAction::DiffMode => Ok(KeyResult::Continue),
+            KeyAction::FileList | KeyAction::DiffMode | KeyAction::Smartlog => {
+                Ok(KeyResult::Continue)
+            }
             KeyAction::Dash => Ok(KeyResult::Continue),
             KeyAction::SearchForward
             | KeyAction::SearchBackward
@@ -947,6 +1243,7 @@ impl EventLoop {
             KeyAction::ContextLess | KeyAction::ContextMore => self.change_context(action),
             KeyAction::FileList => self.open_file_list(),
             KeyAction::DiffMode => self.open_diff_select(),
+            KeyAction::Smartlog => self.open_smartlog(),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
@@ -1078,6 +1375,7 @@ fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<(
         | KeyAction::ContextMore
         | KeyAction::FileList
         | KeyAction::DiffMode
+        | KeyAction::Smartlog
         | KeyAction::SearchForward
         | KeyAction::SearchBackward
         | KeyAction::SearchNext
@@ -1112,6 +1410,7 @@ enum KeyAction {
     ContextMore,
     FileList,
     DiffMode,
+    Smartlog,
 }
 
 fn diff_mode_lines(
@@ -1195,6 +1494,12 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             Some(KeyAction::DiffMode)
+        }
+        KeyCode::Char('t')
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(KeyAction::Smartlog)
         }
         KeyCode::Char('u')
             if !key.modifiers.contains(KeyModifiers::CONTROL)

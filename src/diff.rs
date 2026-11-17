@@ -128,6 +128,19 @@ impl DiffOutput {
         self.files().len().saturating_add(self.untracked.len())
     }
 
+    /// Non-diff lines before the first file (the `git show` / `sl show`
+    /// header when viewing one commit).
+    pub(crate) fn preamble_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(line) => lines.push(line.clone()),
+                Segment::File(_) => break,
+            }
+        }
+        lines
+    }
+
     pub(crate) fn files(&self) -> Vec<&FileDiff> {
         let mut files = Vec::new();
         for segment in &self.segments {
@@ -233,16 +246,108 @@ impl FileDiff {
 /// One row per file for the file-list mode, in `git diff --stat` form:
 /// a path column, `|`, the change count, and a `+`/`-` bar.
 /// `selected` is drawn with a grey / dark-grey background.
+/// Commit message taken from a `git show` / `sl show` preamble.
+/// Git indents the message with four spaces; sl emits a `description:`
+/// block. Trailing blank lines are dropped. Empty if the preamble is
+/// not a show header.
+pub(crate) fn commit_description_lines(preamble: &[String]) -> Vec<String> {
+    if preamble.is_empty() {
+        return Vec::new();
+    }
+    let head = preamble[0].as_str();
+    let sl_header = head.starts_with("commit:");
+    let git_header = head.starts_with("commit ");
+    if !sl_header {
+        if !git_header {
+            return Vec::new();
+        }
+    }
+    if sl_header {
+        for (i, line) in preamble.iter().enumerate() {
+            let trimmed = line.trim_end();
+            if trimmed == "description:" {
+                let mut body = preamble[i + 1..].to_vec();
+                trim_trailing_blank_lines(&mut body);
+                return body;
+            }
+            if let Some(rest) = trimmed.strip_prefix("description:") {
+                let mut body = Vec::new();
+                let rest = rest.trim_start();
+                if !rest.is_empty() {
+                    body.push(rest.to_owned());
+                }
+                body.extend(preamble[i + 1..].iter().cloned());
+                trim_trailing_blank_lines(&mut body);
+                return body;
+            }
+        }
+        return Vec::new();
+    }
+    // git show: the message is the 4-space-indented block.
+    let mut start = None;
+    for (i, line) in preamble.iter().enumerate() {
+        if line.starts_with("    ") {
+            start = Some(i);
+            break;
+        }
+    }
+    let Some(start) = start else {
+        return Vec::new();
+    };
+    let mut body = Vec::new();
+    for line in &preamble[start..] {
+        if let Some(rest) = line.strip_prefix("    ") {
+            body.push(rest.to_owned());
+        } else {
+            break;
+        }
+    }
+    trim_trailing_blank_lines(&mut body);
+    body
+}
+
+fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
+    while let Some(last) = lines.last() {
+        if !last.is_empty() {
+            break;
+        }
+        lines.pop();
+    }
+}
+
+/// How many list rows [`file_list_lines`] prepends for `description`.
+pub(crate) fn file_list_description_rows(description: &[String]) -> usize {
+    if description.is_empty() {
+        return 0;
+    }
+    // The message, then a blank line before the stat.
+    description.len().saturating_add(1)
+}
+
 pub(crate) fn file_list_lines(
     files: &[&FileDiff],
     untracked: &[String],
     selected: usize,
     terminal_bg: crate::terminal_bg::TerminalBg,
     width: crate::terminal::width::Width,
+    description: &[String],
 ) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for (i, text) in description.iter().enumerate() {
+        let style = if i == 0 {
+            diff_file_header_style()
+        } else {
+            Style::plain()
+        };
+        lines.push(Line::from_styled(text, style));
+    }
+    if !description.is_empty() {
+        lines.push(Line::from_styled("", Style::plain()));
+    }
     if files.is_empty() {
         if untracked.is_empty() {
-            return vec![Line::from_styled("(no files)", diff_note_style())];
+            lines.push(Line::from_styled("(no files)", diff_note_style()));
+            return lines;
         }
     }
     let cols = usize::try_from(width.0).unwrap_or(0);
@@ -294,7 +399,6 @@ pub(crate) fn file_list_lines(
         (remain - graph_w, graph_w)
     };
 
-    let mut lines = Vec::with_capacity(files.len().saturating_add(untracked.len()));
     for (i, file) in files.iter().enumerate() {
         let selected_row = i == selected;
         let mut name_style = diff_file_header_style();
@@ -1626,6 +1730,7 @@ diff --git a/bar b/bar
             1,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
+            &[],
         );
         assert_eq!(2, lines.len());
         // git --stat: paths padded so `|` aligns, then the change count
@@ -1708,6 +1813,7 @@ diff --git a/much/longer/path.rs b/much/longer/path.rs
             0,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(60),
+            &[],
         );
         let a = lines[0].plain_text();
         let b = lines[1].plain_text();
@@ -1736,6 +1842,7 @@ diff --git a/foo b/foo
             2,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(48),
+            &[],
         );
         assert_eq!(3, lines.len());
         let stat = lines[0].plain_text();
@@ -1782,6 +1889,7 @@ diff --git a/foo b/foo
             1,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
+            &[],
         );
         let b = crate::diff::file_list_lines(
             &files,
@@ -1789,6 +1897,7 @@ diff --git a/foo b/foo
             1,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
+            &[],
         );
         assert_eq!(a, b);
     }
@@ -1801,6 +1910,7 @@ diff --git a/foo b/foo
             0,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
+            &[],
         );
         assert_eq!(2, lines.len());
         assert_eq!(true, lines[0].plain_text().starts_with("> a.txt"));
@@ -1817,9 +1927,91 @@ diff --git a/foo b/foo
             0,
             crate::terminal_bg::TerminalBg::Dark,
             crate::terminal::width::Width(40),
+            &[],
         );
         assert_eq!(1, empty.len());
         assert_eq!("(no files)", empty[0].plain_text());
+    }
+
+    #[test]
+    fn test_commit_description_from_git_show_preamble() {
+        let preamble = vec![
+            String::from("commit 03446b88a53d3a3aa3ddf57bbc69db3e7c442967"),
+            String::from("Author: T <t@e>"),
+            String::from("Date:   Wed Jan 1 00:00:00 2020 +0000"),
+            String::from(""),
+            String::from("    subject line"),
+            String::from("    "),
+            String::from("    body paragraph"),
+            String::from("    second body"),
+            String::from(""),
+        ];
+        assert_eq!(
+            vec![
+                String::from("subject line"),
+                String::from(""),
+                String::from("body paragraph"),
+                String::from("second body"),
+            ],
+            crate::diff::commit_description_lines(&preamble)
+        );
+    }
+
+    #[test]
+    fn test_commit_description_from_sl_show_preamble() {
+        let preamble = vec![
+            String::from("commit:      c4f82db4495f"),
+            String::from("user:        T <t@e>"),
+            String::from("date:        Tue Nov 17 20:17:16 2026 +0000"),
+            String::from("files:       a"),
+            String::from("description:"),
+            String::from("subject line"),
+            String::from(""),
+            String::from("body paragraph"),
+            String::from("second body"),
+            String::from(""),
+            String::from(""),
+        ];
+        assert_eq!(
+            vec![
+                String::from("subject line"),
+                String::from(""),
+                String::from("body paragraph"),
+                String::from("second body"),
+            ],
+            crate::diff::commit_description_lines(&preamble)
+        );
+    }
+
+    #[test]
+    fn test_file_list_lines_prepends_commit_description() {
+        let input = b"\
+diff --git a/foo b/foo
+--- a/foo
++++ b/foo
+@@ -1 +1 @@
+-a
++b
+";
+        let output = parse_diff(input);
+        let files = output.files();
+        let desc = vec![String::from("subject line"), String::from("body paragraph")];
+        let lines = crate::diff::file_list_lines(
+            &files,
+            &[],
+            0,
+            crate::terminal_bg::TerminalBg::Dark,
+            crate::terminal::width::Width(40),
+            &desc,
+        );
+        assert_eq!(
+            crate::diff::file_list_description_rows(&desc) + 1,
+            lines.len()
+        );
+        assert_eq!("subject line", lines[0].plain_text());
+        assert_eq!("body paragraph", lines[1].plain_text());
+        assert_eq!("", lines[2].plain_text());
+        assert_eq!(true, lines[3].plain_text().starts_with("> foo"));
     }
 
     #[test]

@@ -1106,12 +1106,18 @@ struct VisualRow {
 struct Piece {
     sgr: String,
     text: String,
+    link: Option<String>,
 }
 
 fn row_fingerprint(row: &VisualRow) -> String {
     let mut s = String::new();
     for piece in &row.pieces {
         s.push_str(&piece.sgr);
+        if let Some(link) = &piece.link {
+            s.push('\u{1}');
+            s.push_str(link);
+            s.push('\u{1}');
+        }
         s.push_str(&piece.text);
     }
     s
@@ -1433,6 +1439,7 @@ fn write_one_line(
     out: &mut impl Write,
 ) -> io::Result<()> {
     let mut last_sgr: Option<String> = None;
+    let mut open_link: Option<String> = None;
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             let prev = &rows[i - 1];
@@ -1442,6 +1449,17 @@ fn write_one_line(
             }
         }
         for piece in &row.pieces {
+            if open_link != piece.link {
+                if open_link.is_some() {
+                    out.write_all(OSC8_CLOSE)?;
+                }
+                if let Some(link) = &piece.link {
+                    out.write_all(b"\x1b]8;;")?;
+                    out.write_all(link.as_bytes())?;
+                    out.write_all(b"\x1b\\")?;
+                }
+                open_link = piece.link.clone();
+            }
             if last_sgr.as_deref() != Some(piece.sgr.as_str()) {
                 out.write_all(piece.sgr.as_bytes())?;
                 last_sgr = Some(piece.sgr.clone());
@@ -1449,8 +1467,14 @@ fn write_one_line(
             out.write_all(piece.text.as_bytes())?;
         }
     }
+    if open_link.is_some() {
+        out.write_all(OSC8_CLOSE)?;
+    }
     Ok(())
 }
+
+/// OSC 8 hyperlink closer.
+const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
 
 /// Build the wrapped rows in the half-open range `start..end`.
 ///
@@ -1566,6 +1590,7 @@ fn line_visual_rows(
         let plain_sgr = span.style.sgr_sequence();
         let highlight_sgr = search_highlight(span.style, terminal_bg, false).sgr_sequence();
         let current_sgr = search_highlight(span.style, terminal_bg, true).sgr_sequence();
+        let span_link = span.link.clone();
         for ch in span.content.as_ref().chars() {
             let text = ch.as_str().as_str();
             let ch_end = byte_off + text.len();
@@ -1592,8 +1617,9 @@ fn line_visual_rows(
                 col = Width(0);
                 soft_wrap = true;
             }
+            let link = span_link.clone();
             match pieces.last_mut() {
-                Some(last) if last.sgr == *sgr => {
+                Some(last) if last.sgr == *sgr && last.link == link => {
                     last.text.push_str(text);
                 }
                 _ => {
@@ -1602,6 +1628,7 @@ fn line_visual_rows(
                     pieces.push(Piece {
                         sgr: sgr.clone(),
                         text: owned,
+                        link,
                     });
                 }
             }
@@ -2008,7 +2035,7 @@ diff --git a/foo b/foo
         let output = crate::diff::parse_diff(input);
         let files = output.files();
         let width = crate::terminal::width::Width(40);
-        let lines = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width);
+        let lines = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width, &[]);
         let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 10));
         renderer.set_lines(lines);
         renderer.set_status_label(Some(String::from("Enter: go to file")));
@@ -2016,7 +2043,7 @@ diff --git a/foo b/foo
         renderer.draw(&mut buf).unwrap();
         assert_eq!(false, buf.is_empty());
         buf.clear();
-        let again = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width);
+        let again = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width, &[]);
         renderer.set_lines(again);
         renderer.set_status_label(Some(String::from("Enter: go to file")));
         renderer.draw(&mut buf).unwrap();

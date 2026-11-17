@@ -93,6 +93,7 @@ impl<'a> Parser<'a> {
                         return NextSpan::Span(Span {
                             style: self.style,
                             content,
+                            link: None,
                         });
                     }
                     // Only zero-width chars were skipped before a boundary.

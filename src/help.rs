@@ -5,15 +5,17 @@ const HELP: &str = "\
 Mode switch
 
   d              Diff mode
+  t              Smartlog
   s              Diff stat
   r              Run the diff command now
   u              Decrease context
   U              Increase context
 
 In the diff mode list, j/k move, Enter selects, Esc or d returns.
+In smartlog, j/k move, Enter opens that commit (or the working-copy diff on @), Esc or t returns.
 Modes are the default diff, diff -c ., and diff -r prev
 (git: default diff, show HEAD, diff HEAD^).
-In the diff stat, j/k move, Enter or s goes to the file, Esc returns, q quits.
+In the diff stat, j/k move, Enter or s goes to the file, t opens smartlog, Esc returns, q quits.
 Untracked files are listed after the stat.
 
 Navigation
@@ -103,6 +105,7 @@ mod tests {
         assert_eq!(true, text.contains("'x             Go to mark x"));
         assert_eq!(true, text.contains("s              Diff stat"));
         assert_eq!(true, text.contains("d              Diff mode"));
+        assert_eq!(true, text.contains("t              Smartlog"));
         assert_eq!(true, text.contains("u              Decrease context"));
         assert_eq!(true, text.contains("U              Increase context"));
         assert_eq!(true, text.contains("Up and Down recall previous searches."));

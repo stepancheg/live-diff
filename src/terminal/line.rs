@@ -30,6 +30,19 @@ impl Line {
         self.spans.push(Span {
             style,
             content: TerminalString::sanitize(text),
+            link: None,
+        });
+    }
+
+    /// Append a span that is an OSC 8 hyperlink to `url`.
+    pub(crate) fn push_linked(&mut self, text: &str, style: Style, url: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.spans.push(Span {
+            style,
+            content: TerminalString::sanitize(text),
+            link: Some(String::from(url)),
         });
     }
 

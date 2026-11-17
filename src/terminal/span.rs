@@ -7,6 +7,8 @@ use crate::terminal::width::Width;
 pub(crate) struct Span {
     pub(crate) style: Style,
     pub(crate) content: TerminalString,
+    /// OSC 8 hyperlink target. `None` means the text is not a link.
+    pub(crate) link: Option<String>,
 }
 
 impl Span {
