@@ -1,9 +1,11 @@
-# live-diff
+# sl-tui
 
-A live pager for `sl diff` or `git diff`. While an agent is editing the
-tree, you can watch the diff, ask for a follow-up, and see that change
-as soon as it lands. The diff is re-run on an interval. When the output
-changes, the scroll position is kept; the current
+A terminal UI for [Sapling](https://sapling-scm.com/). It shows the
+smartlog, a live working-copy diff, and a single commit or pull
+request, in one pager.
+
+While an agent is editing the tree, the diff is re-run on an interval.
+When the output changes, the scroll position is kept and the current
 file header stays pinned.
 
 Sapling is used when the repository already has sl metadata (`.sl` or
@@ -11,12 +13,14 @@ Sapling is used when the repository already has sl metadata (`.sl` or
 
 ## Features
 
+- Smartlog (`t`), drawn from `sl smartlog`, with GitHub or Origin PR links
+- Live working-copy diff that keeps the scroll position
+- Commit view (`-c`, or Enter in the smartlog) and diff against the previous commit
 - Git and Sapling
 - Origin and GitHub pull request diffs
-- Live refresh that keeps the scroll position
 - Pinned file header
 - Untracked files on the status bar and in the diff stat
-- Diff stat (`s`)
+- Diff stat (`s`), including the commit message in `-c` mode
 - Wrapped lines stay one logical line, so a double-click selects the whole word
 - `less`-like navigation, including search and marks
 
@@ -37,7 +41,7 @@ Diff stat for the same tree.
 ## Installation
 
 ```
-cargo install --git https://github.com/stepancheg/live-diff
+cargo install --git https://github.com/stepancheg/sl-tui
 ```
 
 or `bin/live-diff`
@@ -68,7 +72,7 @@ or `bin/live-diff`
 | `/` `?` `n` `N` | Search |
 | `s` | Diff stat (Enter or `s` opens the file, Esc returns) |
 | `d` | Diff mode: default, `-c .`, or `-r prev` |
-| `t` | Smartlog (Enter shows that commit, Esc returns) |
+| `t` | Smartlog (Enter opens that commit, or the working-copy diff on `@`; Esc returns) |
 | `u` / `U` | Decrease / increase context |
 | `mx` / `'x` | Set / go to mark |
 
