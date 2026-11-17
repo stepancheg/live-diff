@@ -24,6 +24,7 @@ fn pr_diff_command(program: &str, number: u64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -68,7 +69,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
 
-        let path_env = match std::env::var_os("PATH") {
+        let path_env = match env::var_os("PATH") {
             Some(path_env) => {
                 let mut paths = OsString::from(dir.path().as_os_str());
                 paths.push(":");

@@ -1,8 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
-use std::process::Command;
-use std::process::Stdio;
 
 use crate::diff::DiffOutput;
 use crate::diff::FileDiff;
@@ -15,6 +12,7 @@ use crate::repo::repo::parse_untracked_paths;
 use crate::repo::sl::sl_commit_diff_command;
 use crate::repo::sl::sl_diff_command;
 use crate::repo::sl::sl_untracked_command;
+use crate::repo::test_support::TestRepo;
 
 /// Which repository the shared diff-command scenarios run against.
 ///
@@ -314,15 +312,19 @@ fn check_untracked_command_lists_paths(repo: &Repo) {
 /// Working tree plus an isolated HOME so git and sl do not read the
 /// real user config.
 struct Repo {
-    _dir: tempfile::TempDir,
-    root: PathBuf,
-    home: PathBuf,
+    inner: TestRepo,
     kind: Kind,
 }
 
 impl Repo {
     fn init(kind: Kind) -> Repo {
-        let repo = Repo::prepare(kind);
+        let sl_config = match kind {
+            Kind::Git => false,
+            Kind::Sl => true,
+            Kind::SlOnGit => true,
+        };
+        let inner = TestRepo::prepare(sl_config);
+        let repo = Repo { inner, kind };
         match kind {
             Kind::Git => {
                 repo.ok("git", &["-c", "init.defaultBranch=master", "init", "-q"]);
@@ -345,32 +347,8 @@ impl Repo {
         repo
     }
 
-    fn prepare(kind: Kind) -> Repo {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let root = dir.path().join("repo");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&root).unwrap();
-        let repo = Repo {
-            _dir: dir,
-            root,
-            home,
-            kind,
-        };
-        match kind {
-            Kind::Git => {}
-            Kind::Sl => write_user_sl_config(&repo),
-            Kind::SlOnGit => write_user_sl_config(&repo),
-        }
-        repo
-    }
-
     fn path(&self) -> &Path {
-        &self.root
-    }
-
-    fn home(&self) -> &Path {
-        &self.home
+        self.inner.path()
     }
 
     fn diff_command(&self, context: u32, rev: Option<&str>) -> Vec<String> {
@@ -420,77 +398,17 @@ impl Repo {
     }
 
     fn ok(&self, program: &str, args: &[&str]) -> String {
-        let stdout = self.run_program(program, args);
-        String::from_utf8(stdout).unwrap()
+        self.inner.ok(program, args)
     }
 
     fn run_diff(&self, argv: Vec<String>) -> DiffOutput {
-        let stdout = self.run_ok(&argv);
+        let stdout = self.inner.run_ok(&argv);
         parse_diff(&stdout)
     }
 
     fn run_ok(&self, argv: &[String]) -> Vec<u8> {
-        let Some((program, args)) = argv.split_first() else {
-            panic!("empty command");
-        };
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run_program(program, &arg_refs)
+        self.inner.run_ok(argv)
     }
-
-    fn run_program(&self, program: &str, args: &[&str]) -> Vec<u8> {
-        let mut cmd = Command::new(program);
-        cmd.args(args);
-        apply_env(&mut cmd, self.path(), self.home());
-        let out = cmd.output().unwrap();
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            panic!("command {program} {args:?} failed\nstdout: {stdout}\nstderr: {stderr}");
-        }
-        out.stdout
-    }
-}
-
-fn write_user_sl_config(repo: &Repo) {
-    // Ask sl for the per-user config path under this HOME. Builtin
-    // config turns fsmonitor on; the user file has to override that
-    // for the exact `sl diff` argv under test, which cannot pass
-    // `--config`.
-    // cwd is HOME, not the repo dir, so configfile cannot latch onto
-    // a parent repository.
-    let mut cmd = Command::new("sl");
-    cmd.args(["configfile"]);
-    apply_env(&mut cmd, repo.home(), repo.home());
-    let out = cmd.output().unwrap();
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        panic!("sl configfile failed: {stderr}");
-    }
-    let text = String::from_utf8(out.stdout).unwrap();
-    let mut user_path = None;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("User config path:") {
-            user_path = Some(PathBuf::from(rest.trim()));
-        }
-    }
-    let Some(user_path) = user_path else {
-        panic!("sl configfile did not print a user config path:\n{text}");
-    };
-    if let Some(parent) = user_path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(
-        &user_path,
-        "\
-[ui]
-username = Live Diff Test <live-diff-test@example.com>
-color = never
-paginate = never
-[fsmonitor]
-mode = off
-",
-    )
-    .unwrap();
 }
 
 fn write_file(dir: &Path, rel: &str, contents: &str) {
@@ -499,23 +417,6 @@ fn write_file(dir: &Path, rel: &str, contents: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
-}
-
-fn apply_env(cmd: &mut Command, root: &Path, home: &Path) {
-    cmd.current_dir(root).stdin(Stdio::null()).env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
-    cmd.env("HOME", home)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Live Diff Test")
-        .env("GIT_AUTHOR_EMAIL", "live-diff-test@example.com")
-        .env("GIT_COMMITTER_NAME", "Live Diff Test")
-        .env("GIT_COMMITTER_EMAIL", "live-diff-test@example.com")
-        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+0000")
-        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+0000")
-        .env("LC_ALL", "C");
 }
 
 fn assert_commit_message_before_diff(stdout: &[u8], message: &str) {

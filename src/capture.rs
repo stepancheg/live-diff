@@ -1,9 +1,12 @@
+use std::future;
 use std::io;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::process;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -315,7 +318,7 @@ impl CaptureSpec {
 /// Capture in a loop, sending each snapshot on `tx`.
 /// `refresh` kills the current command and starts the next run at once.
 pub(crate) async fn capture_command_output_loop(
-    shared_spec: Arc<std::sync::Mutex<CaptureSpec>>,
+    shared_spec: Arc<Mutex<CaptureSpec>>,
     context: Arc<AtomicU32>,
     interval: Duration,
     tx: Sender<DiffOutput>,
@@ -418,7 +421,7 @@ fn untracked_paths(untracked: &CachedUntracked) -> Vec<String> {
 async fn wait_interrupt(interrupt: Option<&NotifyRx>) {
     match interrupt {
         Some(rx) => rx.notified().await,
-        None => std::future::pending().await,
+        None => future::pending().await,
     }
 }
 
@@ -478,7 +481,7 @@ fn drain_nonblocking(reader: pipe::Receiver, out: &mut Vec<u8>) -> anyhow::Resul
     }
 }
 
-fn append_nonzero_status(status: &std::process::ExitStatus, out: &mut Vec<u8>) {
+fn append_nonzero_status(status: &process::ExitStatus, out: &mut Vec<u8>) {
     if status.success() {
         return;
     }
@@ -495,9 +498,11 @@ fn append_nonzero_status(status: &std::process::ExitStatus, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::io::Write;
     use std::os::fd::OwnedFd;
     use std::path::PathBuf;
+    use std::process;
     use std::time::Duration;
 
     use tokio::net::unix::pipe;
@@ -637,13 +642,13 @@ mod tests {
         );
     }
 
-    fn receiver_from_pipe(reader: std::io::PipeReader) -> pipe::Receiver {
+    fn receiver_from_pipe(reader: io::PipeReader) -> pipe::Receiver {
         pipe::Receiver::from_owned_fd(OwnedFd::from(reader)).unwrap()
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_drain_nonblocking_reads_buffer_and_stops_with_writer_open() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, mut writer) = io::pipe().unwrap();
         writer.write_all(b"hello").unwrap();
         let mut out = Vec::new();
         out.extend_from_slice(b"pre");
@@ -655,7 +660,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_drain_nonblocking_empty_pipe_with_writer_open() {
-        let (reader, writer) = std::io::pipe().unwrap();
+        let (reader, writer) = io::pipe().unwrap();
         let mut out = Vec::new();
         drain_nonblocking(receiver_from_pipe(reader), &mut out).unwrap();
         assert_eq!(Vec::<u8>::new(), out);
@@ -664,7 +669,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_drain_nonblocking_reads_to_eof() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (reader, mut writer) = io::pipe().unwrap();
         writer.write_all(b"abc").unwrap();
         drop(writer);
         let mut out = Vec::new();
@@ -717,10 +722,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_capture_returns_when_child_exits_despite_open_pipe() {
-        let pid_path = PathBuf::from(format!(
-            "/tmp/live-diff-capture-test-{}.pid",
-            std::process::id()
-        ));
+        let pid_path = PathBuf::from(format!("/tmp/live-diff-capture-test-{}.pid", process::id()));
         let _cleanup = KillPidFile {
             path: pid_path.clone(),
         };

@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -33,7 +34,7 @@ pub(crate) fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
 }
 
 pub(crate) fn diff_tool() -> anyhow::Result<DiffTool> {
-    let dir = std::env::current_dir()?;
+    let dir = env::current_dir()?;
     diff_tool_in(&dir)
 }
 

@@ -1,3 +1,5 @@
+use std::mem;
+
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -68,7 +70,7 @@ impl Prompt {
 
     pub(crate) fn take_query(&mut self) -> String {
         self.cursor = 0;
-        std::mem::take(&mut self.query)
+        mem::take(&mut self.query)
     }
 
     /// Display columns from the start of the status label to the caret.
@@ -170,7 +172,7 @@ impl Prompt {
         }
         let next = match self.history_pos {
             None => {
-                self.draft = std::mem::take(&mut self.query);
+                self.draft = mem::take(&mut self.query);
                 history.len() - 1
             }
             Some(0) => return false,
@@ -190,7 +192,7 @@ impl Prompt {
             self.replace_query(history[i + 1].clone());
         } else {
             self.history_pos = None;
-            let draft = std::mem::take(&mut self.draft);
+            let draft = mem::take(&mut self.draft);
             self.replace_query(draft);
         }
         true
