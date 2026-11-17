@@ -7,7 +7,7 @@ pub(crate) const NVIM_LIGHT_YELLOW: TerminalColor = TerminalColor::Rgb(0xfc, 0xe
 /// Neovim `NvimDarkYellow`.
 pub(crate) const NVIM_DARK_YELLOW: TerminalColor = TerminalColor::Rgb(0x6b, 0x53, 0x00);
 /// Neovim `NvimLightGrey1`.
-pub(crate) const NVIM_LIGHT_GREY1: TerminalColor = TerminalColor::Rgb(0xee, 0xf1, 0xf8);
+const NVIM_LIGHT_GREY1: TerminalColor = TerminalColor::Rgb(0xee, 0xf1, 0xf8);
 /// Neovim `NvimDarkGrey1`.
 pub(crate) const NVIM_DARK_GREY1: TerminalColor = TerminalColor::Rgb(0x07, 0x08, 0x0d);
 

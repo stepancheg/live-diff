@@ -63,7 +63,7 @@ impl TestRepo {
         self.run_program(program, &arg_refs)
     }
 
-    pub(crate) fn run_program(&self, program: &str, args: &[&str]) -> Vec<u8> {
+    fn run_program(&self, program: &str, args: &[&str]) -> Vec<u8> {
         let mut cmd = Command::new(program);
         cmd.args(args);
         apply_env(&mut cmd, &self.root, &self.home);
@@ -118,7 +118,7 @@ mode = off
 
 /// Clear the environment, keep PATH, and point HOME and git/sl
 /// identity at the fixture.
-pub(crate) fn apply_env(cmd: &mut Command, root: &Path, home: &Path) {
+fn apply_env(cmd: &mut Command, root: &Path, home: &Path) {
     cmd.current_dir(root).stdin(Stdio::null()).env_clear();
     if let Some(path) = env::var_os("PATH") {
         cmd.env("PATH", path);

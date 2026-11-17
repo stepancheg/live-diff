@@ -106,7 +106,7 @@ impl Style {
     }
 
     /// Apply a CSI SGR parameter list (`ESC [ ... m`).
-    pub(crate) fn apply_sgr_to_style(&mut self, mut params: &[u32]) {
+    fn apply_sgr_to_style(&mut self, mut params: &[u32]) {
         while let Some((&p, rest)) = params.split_first() {
             params = rest;
             match p {

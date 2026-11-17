@@ -239,12 +239,12 @@ impl<'a> TerminalStr<'a> {
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn split_at(self, at: Width) -> (TerminalStr<'a>, TerminalStr<'a>) {
+    fn split_at(self, at: Width) -> (TerminalStr<'a>, TerminalStr<'a>) {
         let left = self.take(at);
         self.split_at_unchecked(left.width_len())
     }
 
-    pub(crate) fn split_at_unchecked(self, at: WidthLen) -> (TerminalStr<'a>, TerminalStr<'a>) {
+    fn split_at_unchecked(self, at: WidthLen) -> (TerminalStr<'a>, TerminalStr<'a>) {
         let (a, b) = self.content.split_at(at.len);
         let a = TerminalStr::unchecked_new(a, at.width);
         let b = TerminalStr::unchecked_new(b, self.width - at.width);

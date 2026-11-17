@@ -252,12 +252,12 @@ mod tests {
     use crossterm::event::KeyEventState;
     use crossterm::event::KeyModifiers;
 
-    use crate::height::Height;
     use crate::render::Renderer;
     use crate::search::prompt::Prompt;
     use crate::search::prompt::PromptOutcome;
-    use crate::size::Size;
+    use crate::terminal::height::Height;
     use crate::terminal::parse::parse_command_output;
+    use crate::terminal::size::Size;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
 

@@ -1,4 +1,4 @@
-use crate::height::Height;
+use crate::terminal::height::Height;
 use crate::terminal::width::Width;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

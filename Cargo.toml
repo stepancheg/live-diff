@@ -10,6 +10,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 compact_str = "0.10.0"
 crossterm = "0.29.0"
 derive_more = { version = "2.1", features = ["display", "add", "add_assign", "sum"] }
+jiff = { version = "1.0.0", default-features = false, features = ["std"] }
 libc = "0.2.191"
 ref-cast = "1.0.27"
 regex = "1.12.2"

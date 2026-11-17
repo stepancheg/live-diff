@@ -21,12 +21,10 @@ use crate::diff::DiffOutput;
 use crate::diff::commit_description_lines;
 use crate::diff::file_list_description_rows;
 use crate::diff::file_list_lines;
-use crate::height::Height;
 use crate::help::help_lines;
 use crate::mark::MarkOp;
 use crate::mark::Marks;
 use crate::mark::NOT_SET;
-use crate::notify_pair::NotifyTx;
 use crate::render::Renderer;
 use crate::render::ScrollAnchor;
 use crate::repo::repo::DiffTool;
@@ -48,17 +46,20 @@ use crate::search::state::PATTERN_NOT_FOUND;
 use crate::search::state::Search;
 use crate::search::state::is_case_mode_status;
 use crate::search::state::status_after_output;
-use crate::size::Size;
+use crate::smartlog::SmartlogSelection;
 use crate::smartlog::commit_header_row;
-use crate::smartlog::smartlog_lines;
-use crate::smartlog::unix_now;
+use crate::smartlog::render_lines;
+use crate::terminal::height::Height;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
 use crate::terminal::line::fold_case;
+use crate::terminal::size::Size;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 use crate::theme::diff_file_header_style;
 use crate::theme::diff_note_style;
+use crate::util::notify_pair::NotifyTx;
+use crate::util::time::ts_secs::TimestampsSecs;
 
 enum KeyResult {
     Continue,
@@ -126,8 +127,8 @@ pub(crate) struct EventLoop {
     diff_mode_index: usize,
     /// Latest smartlog snapshot for the `t` view.
     smartlog: Option<SmartlogView>,
-    /// Selected commit in the smartlog view.
-    smartlog_sel: usize,
+    /// Selected commit in the smartlog view (digest and index).
+    smartlog_sel: Option<SmartlogSelection>,
     /// True when smartlog was opened from the diffstat page, so Esc
     /// returns there.
     smartlog_from_files: bool,
@@ -160,7 +161,7 @@ impl EventLoop {
             tool,
             diff_mode_index: 0,
             smartlog: None,
-            smartlog_sel: 0,
+            smartlog_sel: None,
             smartlog_from_files: false,
             start_view,
         }
@@ -734,6 +735,16 @@ impl EventLoop {
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
+            KeyAction::ScrollViewDown => {
+                self.help_renderer.scroll_down();
+                self.help_renderer.draw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollViewUp => {
+                self.help_renderer.scroll_up();
+                self.help_renderer.draw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
             KeyAction::Smartlog => self.open_smartlog(),
             KeyAction::Dash
             | KeyAction::DiffMode
@@ -898,6 +909,16 @@ impl EventLoop {
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
+            KeyAction::ScrollViewDown => {
+                self.help_renderer.scroll_down();
+                self.help_renderer.draw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollViewUp => {
+                self.help_renderer.scroll_up();
+                self.help_renderer.draw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
             KeyAction::FileList
             | KeyAction::Smartlog
             | KeyAction::Dash
@@ -911,15 +932,18 @@ impl EventLoop {
     }
 
     /// Commit to highlight when the tree opens. In `-c` mode that is
-    /// the commit being viewed; a refresh of an open tree keeps the
-    /// same node when it is still present.
-    fn smartlog_open_selection(&self, view: &SmartlogView) -> usize {
+    /// the commit being viewed. A refresh keeps the selected digest
+    /// when it is still present, otherwise the previous index.
+    fn smartlog_open_selection(&self, view: &SmartlogView) -> Option<SmartlogSelection> {
         if matches!(self.mode, Mode::Smartlog) {
-            if let Some(prev) = &self.smartlog {
-                if let Some(commit) = prev.commits.get(self.smartlog_sel) {
-                    if let Some(i) = find_commit_index(view, &commit.node) {
-                        return i;
-                    }
+            if let Some(sel) = &self.smartlog_sel {
+                if let Some(index) = sel.resolve(view) {
+                    // Keep the digest even on index fallback so a later
+                    // refresh can still find that commit if it returns.
+                    return Some(SmartlogSelection {
+                        digest: sel.digest.clone(),
+                        index,
+                    });
                 }
             }
         }
@@ -935,10 +959,11 @@ impl EventLoop {
         };
         if let Some(rev) = rev {
             if let Some(i) = find_commit_index(view, &rev) {
-                return i;
+                return SmartlogSelection::at(view, i);
             }
         }
-        current_commit_index(view).unwrap_or(0)
+        let i = current_commit_index(view).unwrap_or(0);
+        SmartlogSelection::at(view, i)
     }
 
     fn open_smartlog(&mut self) -> anyhow::Result<KeyResult> {
@@ -967,9 +992,13 @@ impl EventLoop {
                 self.paint_smartlog(true)?;
                 // Put the selected commit's header at the top.
                 if let Some(view) = &self.smartlog {
-                    let row = commit_header_row(view, self.smartlog_sel);
-                    self.help_renderer.scroll_to_line(row);
-                    self.help_renderer.redraw(&mut io::stdout())?;
+                    if let Some(index) =
+                        self.smartlog_sel.as_ref().and_then(|sel| sel.resolve(view))
+                    {
+                        let row = commit_header_row(view, index);
+                        self.help_renderer.scroll_to_line(row);
+                        self.help_renderer.redraw(&mut io::stdout())?;
+                    }
                 }
                 Ok(KeyResult::Continue)
             }
@@ -1003,10 +1032,10 @@ impl EventLoop {
         let Some(view) = &self.smartlog else {
             return Ok(());
         };
-        let lines = smartlog_lines(
+        let lines = render_lines(
             view,
-            Some(self.smartlog_sel),
-            unix_now(),
+            self.smartlog_sel.as_ref(),
+            TimestampsSecs::now(),
             self.help_renderer.terminal_bg(),
             self.size.width,
         );
@@ -1023,8 +1052,10 @@ impl EventLoop {
         self.help_renderer.set_lines(lines);
         self.help_renderer
             .set_status_label(Some(String::from(hint)));
-        let row = commit_header_row(view, self.smartlog_sel);
-        self.help_renderer.ensure_line_visible(row);
+        if let Some(index) = self.smartlog_sel.as_ref().and_then(|sel| sel.resolve(view)) {
+            let row = commit_header_row(view, index);
+            self.help_renderer.ensure_line_visible(row);
+        }
         if force {
             self.help_renderer.redraw(&mut io::stdout())?;
         } else {
@@ -1037,19 +1068,33 @@ impl EventLoop {
         let Some(view) = &self.smartlog else {
             return Ok(());
         };
+        if view.commits.is_empty() {
+            self.smartlog_sel = None;
+            return self.paint_smartlog(false);
+        }
         let last = view.commits.len().saturating_sub(1);
-        self.smartlog_sel = target.min(last);
+        let index = target.min(last);
+        self.smartlog_sel = SmartlogSelection::at(view, index);
         self.paint_smartlog(false)
+    }
+
+    fn resolved_smartlog_index(&self) -> Option<usize> {
+        let view = self.smartlog.as_ref()?;
+        let sel = self.smartlog_sel.as_ref()?;
+        sel.resolve(view)
     }
 
     fn apply_smartlog_selection(&mut self) -> anyhow::Result<KeyResult> {
         let Some(view) = &self.smartlog else {
             return self.close_smartlog();
         };
-        let Some(commit) = view.commits.get(self.smartlog_sel) else {
+        let Some(index) = self.resolved_smartlog_index() else {
             return self.close_smartlog();
         };
-        let node = commit.node.clone();
+        let Some(commit) = view.commits.get(index) else {
+            return self.close_smartlog();
+        };
+        let node = commit.node.0.clone();
         let is_current = commit.current;
         let Some(tool) = self.tool else {
             return self.close_smartlog();
@@ -1114,12 +1159,18 @@ impl EventLoop {
                 Ok(result)
             }
             KeyAction::ScrollDown => {
-                let next = self.smartlog_sel.saturating_add(1);
+                let next = match self.resolved_smartlog_index() {
+                    Some(i) => i.saturating_add(1),
+                    None => 0,
+                };
                 self.move_smartlog_sel(next)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollUp => {
-                let prev = self.smartlog_sel.saturating_sub(1);
+                let prev = match self.resolved_smartlog_index() {
+                    Some(i) => i.saturating_sub(1),
+                    None => 0,
+                };
                 self.move_smartlog_sel(prev)?;
                 Ok(KeyResult::Continue)
             }
@@ -1132,17 +1183,33 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageDown => {
-                let next = self.smartlog_sel.saturating_add(page);
+                let next = match self.resolved_smartlog_index() {
+                    Some(i) => i.saturating_add(page),
+                    None => 0,
+                };
                 self.move_smartlog_sel(next)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageUp => {
-                let prev = self.smartlog_sel.saturating_sub(page);
+                let prev = match self.resolved_smartlog_index() {
+                    Some(i) => i.saturating_sub(page),
+                    None => 0,
+                };
                 self.move_smartlog_sel(prev)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
                 self.help_renderer.redraw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollViewDown => {
+                self.help_renderer.scroll_down();
+                self.help_renderer.draw(&mut io::stdout())?;
+                Ok(KeyResult::Continue)
+            }
+            KeyAction::ScrollViewUp => {
+                self.help_renderer.scroll_up();
+                self.help_renderer.draw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
@@ -1236,6 +1303,8 @@ impl EventLoop {
             | KeyAction::GotoMark => Ok(KeyResult::Continue),
             action @ (KeyAction::ScrollDown
             | KeyAction::ScrollUp
+            | KeyAction::ScrollViewDown
+            | KeyAction::ScrollViewUp
             | KeyAction::Redraw
             | KeyAction::ScrollTop
             | KeyAction::ScrollBottom
@@ -1305,6 +1374,8 @@ impl EventLoop {
             }
             action @ (KeyAction::ScrollDown
             | KeyAction::ScrollUp
+            | KeyAction::ScrollViewDown
+            | KeyAction::ScrollViewUp
             | KeyAction::Redraw
             | KeyAction::ScrollTop
             | KeyAction::ScrollBottom
@@ -1380,11 +1451,11 @@ fn stat_list_labels(output: &DiffOutput) -> Vec<String> {
 
 fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<()> {
     match action {
-        KeyAction::ScrollDown => {
+        KeyAction::ScrollDown | KeyAction::ScrollViewDown => {
             view.scroll_down();
             view.draw(&mut io::stdout())?;
         }
-        KeyAction::ScrollUp => {
+        KeyAction::ScrollUp | KeyAction::ScrollViewUp => {
             view.scroll_up();
             view.draw(&mut io::stdout())?;
         }
@@ -1440,6 +1511,9 @@ enum KeyAction {
     SearchPrev,
     ScrollDown,
     ScrollUp,
+    /// One-line scroll that does not move a list selection.
+    ScrollViewDown,
+    ScrollViewUp,
     ScrollTop,
     ScrollBottom,
     ScrollPageDown,
@@ -1505,6 +1579,19 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
         )
     {
         return Some(KeyAction::Redraw);
+    }
+    // less/vim: ^E forward one line, ^Y backward one line. The list
+    // selection (cursor) stays on the same entry.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                return Some(KeyAction::ScrollViewDown);
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                return Some(KeyAction::ScrollViewUp);
+            }
+            _ => {}
+        }
     }
     match key.code {
         KeyCode::Esc => Some(KeyAction::DismissMessage),

@@ -93,7 +93,7 @@ impl TerminalString {
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn pop_char(&mut self) -> Option<TerminalChar> {
+    fn pop_char(&mut self) -> Option<TerminalChar> {
         let pos = self.content.grapheme_indices(true).next_back()?.0;
         let term_char = TerminalChar::new(&self.content[pos..])?;
         self.content.to_mut().truncate(pos);
@@ -113,7 +113,7 @@ impl TerminalString {
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn rtruncate(&mut self, width: Width) {
+    fn rtruncate(&mut self, width: Width) {
         let Some(truncate) = self.width.checked_sub(width) else {
             return;
         };

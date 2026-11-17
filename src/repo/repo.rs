@@ -24,12 +24,12 @@ pub(crate) const DEFAULT_CONTEXT: u32 = 3;
 pub(crate) const MAX_CONTEXT: u32 = 999;
 
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn diff_command_in(dir: &Path) -> anyhow::Result<Vec<String>> {
+fn diff_command_in(dir: &Path) -> anyhow::Result<Vec<String>> {
     let tool = diff_tool_in(dir)?;
     Ok(command_for_tool(tool, DEFAULT_CONTEXT, None, None))
 }
 
-pub(crate) fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
+fn diff_tool_in(dir: &Path) -> anyhow::Result<DiffTool> {
     repo_kind(dir)
 }
 

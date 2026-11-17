@@ -73,6 +73,7 @@ or `bin/sl-tui`
 | `q` | Quit |
 | `r` | Run the diff now |
 | `j` / `k`, arrows | Scroll |
+| `^e` / `^y` | Scroll down / up; in a list the selection stays |
 | `Space` / `PgDn`, `PgUp` | Page |
 | `g` / `G` | Top / bottom |
 | `/` `?` `n` `N` | Search |

@@ -1,6 +1,11 @@
 use std::process::Command;
 use std::str;
 
+use crate::repo::digest::CommitDigest;
+use crate::repo::forge::Forge;
+use crate::repo::forge::detect_forge;
+use crate::util::time::ts_secs::TimestampsSecs;
+
 /// Null parent hash emitted by `p1node` / `p2node` when that parent
 /// does not exist.
 const NULL_NODE: &str = "0000000000000000000000000000000000000000";
@@ -8,10 +13,10 @@ const NULL_NODE: &str = "0000000000000000000000000000000000000000";
 /// One commit from [`sl_smartlog_command`], enough to rebuild the
 /// parent DAG `sl sl` draws.
 pub(crate) struct SmartlogCommit {
-    pub(crate) node: String,
+    pub(crate) node: CommitDigest,
     /// Present parents only, first parent then second.
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) parents: Vec<String>,
+    pub(crate) parents: Vec<CommitDigest>,
     pub(crate) phase: String,
     pub(crate) bookmarks: Vec<String>,
     pub(crate) desc: String,
@@ -19,7 +24,7 @@ pub(crate) struct SmartlogCommit {
     pub(crate) github_pr: Option<u64>,
     pub(crate) author: String,
     /// Commit time as unix seconds.
-    pub(crate) date_unix: i64,
+    pub(crate) date_unix: TimestampsSecs,
     /// True when this commit is the working-copy parent (graph `@`).
     pub(crate) current: bool,
 }
@@ -48,30 +53,10 @@ pub(crate) struct SmartlogView {
     pub(crate) forge: Option<Forge>,
 }
 
-/// Host that owns pull requests for this checkout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Forge {
-    GitHub { owner: String, repo: String },
-    Origin { org: String, name: String },
-}
-
-impl Forge {
-    pub(crate) fn pull_url(&self, number: u64) -> String {
-        match self {
-            Forge::GitHub { owner, repo } => {
-                format!("https://github.com/{owner}/{repo}/pull/{number}")
-            }
-            Forge::Origin { org, name } => {
-                format!("https://cursor.com/codebase/{org}/{name}/pull/{number}")
-            }
-        }
-    }
-}
-
 /// `sl smartlog` with a JSON commit record and the same three-line
 /// template shape as `sl sl` (`header`, `desc`, separator), so the
 /// graph glyphs match Sapling's.
-pub(crate) fn sl_smartlog_command() -> Vec<String> {
+fn sl_smartlog_command() -> Vec<String> {
     // `{sl}` emits header, description, and a separator newline; the
     // two extra newlines after the JSON line recreate that row shape.
     // Graph columns are drawn by smartlog and prefixed on every line.
@@ -110,124 +95,15 @@ pub(crate) fn fetch_smartlog() -> anyhow::Result<SmartlogView> {
     Ok(view)
 }
 
-/// Pick Origin when a remote is `origin.cursor.com`, otherwise GitHub.
-fn detect_forge() -> Option<Forge> {
-    let mut github = None;
-    for url in remote_urls() {
-        if let Some(forge) = forge_from_remote_url(&url) {
-            match forge {
-                Forge::Origin { .. } => return Some(forge),
-                Forge::GitHub { .. } => {
-                    if github.is_none() {
-                        github = Some(forge);
-                    }
-                }
-            }
-        }
-    }
-    github
-}
-
-fn remote_urls() -> Vec<String> {
-    let mut urls = Vec::new();
-    if let Ok(out) = Command::new("git").args(["remote", "-v"]).output() {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                // "name URL (fetch)"
-                let mut parts = line.split_whitespace();
-                let _name = parts.next();
-                if let Some(url) = parts.next() {
-                    urls.push(url.to_owned());
-                }
-            }
-        }
-    }
-    urls
-}
-
-/// Parse a git remote into a forge. `.git` suffix is ignored.
-pub(crate) fn forge_from_remote_url(url: &str) -> Option<Forge> {
-    let url = url.trim();
-    // Drop userinfo so `https://user@host/path` still parses.
-    let without_user = match url.find("://") {
-        Some(scheme_end) => {
-            let rest = &url[scheme_end + 3..];
-            match rest.find('@') {
-                Some(at) => {
-                    let mut s = String::from(&url[..scheme_end + 3]);
-                    s.push_str(&rest[at + 1..]);
-                    s
-                }
-                None => url.to_owned(),
-            }
-        }
-        None => url.to_owned(),
-    };
-    // scp-like: git@host:org/name.git
-    if let Some(at) = without_user.find('@') {
-        if !without_user.contains("://") {
-            let after = &without_user[at + 1..];
-            if let Some(colon) = after.find(':') {
-                let host = &after[..colon];
-                let path = &after[colon + 1..];
-                return forge_from_host_path(host, path);
-            }
-        }
-    }
-    if let Some(scheme_end) = without_user.find("://") {
-        let rest = &without_user[scheme_end + 3..];
-        if !rest.contains('/') {
-            return None;
-        }
-        // rest is host/path...
-        let slash = rest.find('/')?;
-        let host = &rest[..slash];
-        let path = &rest[slash + 1..];
-        // host may include :port
-        let host = match host.find(':') {
-            Some(i) => &host[..i],
-            None => host,
-        };
-        return forge_from_host_path(host, path);
-    }
-    None
-}
-
-fn forge_from_host_path(host: &str, path: &str) -> Option<Forge> {
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = path.split('/');
-    let a = parts.next()?;
-    let b = parts.next()?;
-    if a.is_empty() || b.is_empty() {
-        return None;
-    }
-    // Ignore extra path segments (e.g. tree/branch); org/name is enough
-    // when the first two segments are the repo.
-    if host == "origin.cursor.com" {
-        return Some(Forge::Origin {
-            org: a.to_owned(),
-            name: b.to_owned(),
-        });
-    }
-    if host == "github.com" {
-        return Some(Forge::GitHub {
-            owner: a.to_owned(),
-            repo: b.to_owned(),
-        });
-    }
-    None
-}
-
 /// Parse NDJSON from [`sl_smartlog_command`]. Graph prefixes and
 /// edge-only lines are skipped; only the commit records are returned.
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn parse_smartlog(bytes: &[u8]) -> anyhow::Result<Vec<SmartlogCommit>> {
+fn parse_smartlog(bytes: &[u8]) -> anyhow::Result<Vec<SmartlogCommit>> {
     Ok(parse_smartlog_view(bytes)?.commits)
 }
 
 /// Parse smartlog stdout into commits plus the graph rows to paint.
-pub(crate) fn parse_smartlog_view(bytes: &[u8]) -> anyhow::Result<SmartlogView> {
+fn parse_smartlog_view(bytes: &[u8]) -> anyhow::Result<SmartlogView> {
     let text = str::from_utf8(bytes)?;
     let mut commits = Vec::new();
     let mut rows = Vec::new();
@@ -300,13 +176,13 @@ fn parse_smartlog_line(line: &str) -> anyhow::Result<SmartlogCommit> {
     let raw: RawCommit = serde_json::from_str(line)?;
     let mut parents = Vec::new();
     if raw.p1 != NULL_NODE {
-        parents.push(raw.p1);
+        parents.push(CommitDigest(raw.p1));
     }
     if raw.p2 != NULL_NODE {
-        parents.push(raw.p2);
+        parents.push(CommitDigest(raw.p2));
     }
     Ok(SmartlogCommit {
-        node: raw.node,
+        node: CommitDigest(raw.node),
         parents,
         phase: raw.phase,
         bookmarks: raw.bookmarks,
@@ -318,11 +194,11 @@ fn parse_smartlog_line(line: &str) -> anyhow::Result<SmartlogCommit> {
     })
 }
 
-fn hgdate_unix(date: &str) -> i64 {
+fn hgdate_unix(date: &str) -> TimestampsSecs {
     let Some(secs) = date.split_whitespace().next() else {
-        return 0;
+        return TimestampsSecs(0);
     };
-    secs.parse::<i64>().unwrap_or(0)
+    TimestampsSecs(secs.parse::<i64>().unwrap_or(0))
 }
 
 fn github_pr_number(value: &serde_json::Value) -> anyhow::Result<Option<u64>> {
@@ -356,12 +232,12 @@ pub(crate) fn find_commit_index(view: &SmartlogView, rev: &str) -> Option<usize>
     if rev == "." || rev == "HEAD" {
         return current_commit_index(view);
     }
-    if let Some(i) = view.commits.iter().position(|c| c.node == rev) {
+    if let Some(i) = view.commits.iter().position(|c| c.node.0 == rev) {
         return Some(i);
     }
     let mut found = None;
     for (i, commit) in view.commits.iter().enumerate() {
-        if commit.node.starts_with(rev) {
+        if commit.node.0.starts_with(rev) {
             if found.is_some() {
                 return None;
             }
@@ -373,9 +249,11 @@ pub(crate) fn find_commit_index(view: &SmartlogView, rev: &str) -> Option<usize>
 
 #[cfg(test)]
 mod tests {
+    use crate::repo::digest::CommitDigest;
     use crate::repo::sl_smartlog::parse_smartlog;
     use crate::repo::sl_smartlog::sl_smartlog_command;
     use crate::repo::test_support::TestRepo;
+    use crate::util::time::ts_secs::TimestampsSecs;
 
     #[test]
     fn test_parse_smartlog_json_lines() {
@@ -384,15 +262,18 @@ mod tests {
 "#;
         let commits = parse_smartlog(bytes).unwrap();
         assert_eq!(2, commits.len());
-        assert_eq!("aaa", commits[0].node);
-        assert_eq!(vec![String::from("bbb")], commits[0].parents);
+        assert_eq!(CommitDigest(String::from("aaa")), commits[0].node);
+        assert_eq!(vec![CommitDigest(String::from("bbb"))], commits[0].parents);
         assert_eq!(vec![String::from("main")], commits[0].bookmarks);
         assert_eq!("say \"hi\"", commits[0].desc);
         assert_eq!("draft", commits[0].phase);
         assert_eq!(Some(12), commits[0].github_pr);
         assert_eq!(None, commits[1].github_pr);
         assert_eq!(
-            vec![String::from("aaa"), String::from("ddd")],
+            vec![
+                CommitDigest(String::from("aaa")),
+                CommitDigest(String::from("ddd")),
+            ],
             commits[1].parents
         );
         assert_eq!("merge", commits[1].desc);
@@ -434,16 +315,24 @@ mod tests {
         // Same fork Sapling draws: the side commit joins with ├─╯.
         assert_eq!(true, graph.contains("├─╯"));
         let commits = parse_smartlog(&bytes).unwrap();
-        let mut by_desc: Vec<(String, String, Vec<String>)> = commits
+        let mut by_desc: Vec<(String, CommitDigest, Vec<CommitDigest>)> = commits
             .iter()
             .map(|c| (c.desc.clone(), c.node.clone(), c.parents.clone()))
             .collect();
         by_desc.sort();
         assert_eq!(
             vec![
-                (String::from("left"), left, vec![root.clone()]),
-                (String::from("right"), right, vec![root.clone()]),
-                (String::from("root"), root, Vec::new()),
+                (
+                    String::from("left"),
+                    CommitDigest(left),
+                    vec![CommitDigest(root.clone())],
+                ),
+                (
+                    String::from("right"),
+                    CommitDigest(right),
+                    vec![CommitDigest(root.clone())],
+                ),
+                (String::from("root"), CommitDigest(root), Vec::new()),
             ],
             by_desc
         );
@@ -457,14 +346,14 @@ mod tests {
         use crate::repo::sl_smartlog::SmartlogView;
         use crate::repo::sl_smartlog::find_commit_index;
         let commit = |node: &str, current: bool| SmartlogCommit {
-            node: String::from(node),
+            node: CommitDigest(String::from(node)),
             parents: Vec::new(),
             phase: String::from("draft"),
             bookmarks: Vec::new(),
             desc: String::from("d"),
             github_pr: None,
             author: String::new(),
-            date_unix: 0,
+            date_unix: TimestampsSecs(0),
             current,
         };
         let view = SmartlogView {
@@ -488,49 +377,6 @@ mod tests {
         assert_eq!(Some(1), find_commit_index(&view, "HEAD"));
         // Ambiguous one-character prefix.
         assert_eq!(None, find_commit_index(&view, ""));
-    }
-
-    #[test]
-    fn test_forge_from_remote_url() {
-        use crate::repo::sl_smartlog::Forge;
-        use crate::repo::sl_smartlog::forge_from_remote_url;
-        assert_eq!(
-            Some(Forge::GitHub {
-                owner: String::from("stepancheg"),
-                repo: String::from("live-diff"),
-            }),
-            forge_from_remote_url("https://github.com/stepancheg/live-diff.git")
-        );
-        assert_eq!(
-            Some(Forge::GitHub {
-                owner: String::from("stepancheg"),
-                repo: String::from("live-diff"),
-            }),
-            forge_from_remote_url("git@github.com:stepancheg/live-diff.git")
-        );
-        assert_eq!(
-            Some(Forge::Origin {
-                org: String::from("spacexsi"),
-                name: String::from("xai"),
-            }),
-            forge_from_remote_url("https://origin.cursor.com/spacexsi/xai.git")
-        );
-        assert_eq!(
-            "https://cursor.com/codebase/spacexsi/xai/pull/2032111",
-            Forge::Origin {
-                org: String::from("spacexsi"),
-                name: String::from("xai"),
-            }
-            .pull_url(2032111)
-        );
-        assert_eq!(
-            "https://github.com/stepancheg/live-diff/pull/12",
-            Forge::GitHub {
-                owner: String::from("stepancheg"),
-                repo: String::from("live-diff"),
-            }
-            .pull_url(12)
-        );
     }
 
     fn sl_commit(repo: &TestRepo, message: &str) -> String {

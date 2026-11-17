@@ -3,22 +3,20 @@ mod capture;
 mod debug_or_test;
 mod diff;
 mod event_loop;
-mod height;
 mod help;
 mod interval_arg;
 mod lines_with_wrapped_row_count;
 mod mark;
-mod notify_pair;
 mod pr_diff;
 mod render;
 mod repo;
 mod search;
-mod size;
 mod smartlog;
 mod terminal;
 mod terminal_bg;
 mod terminal_guard;
 mod theme;
+mod util;
 mod wrapped_row;
 
 use std::io;
@@ -41,7 +39,6 @@ use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
 use crate::event_loop::StartView;
 use crate::interval_arg::IntervalArg;
-use crate::notify_pair::NotifyTx;
 use crate::pr_diff::github_pr_diff_command;
 use crate::pr_diff::origin_pr_diff_command;
 use crate::render::terminal_size;
@@ -53,6 +50,7 @@ use crate::search::history::store::History;
 use crate::terminal_bg::query_terminal_bg;
 use crate::terminal_guard::TerminalGuard;
 use crate::terminal_guard::restore_terminal;
+use crate::util::notify_pair::NotifyTx;
 
 #[derive(clap::Parser, Debug)]
 struct Args {

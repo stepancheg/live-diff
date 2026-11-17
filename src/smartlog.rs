@@ -1,8 +1,6 @@
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-
 use unicode_width::UnicodeWidthStr;
 
+use crate::repo::digest::CommitDigest;
 use crate::repo::sl_smartlog::SmartlogCommit;
 use crate::repo::sl_smartlog::SmartlogRow;
 use crate::repo::sl_smartlog::SmartlogRowKind;
@@ -12,23 +10,62 @@ use crate::terminal::line::Line;
 use crate::terminal::style::Style;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
+use crate::util::time::ts_secs::TimestampsSecs;
+
+/// Selected smartlog commit: full node digest and its index in the
+/// view that selection was made against. [`SmartlogSelection::resolve`]
+/// matches the digest first so a new commit on top does not move the
+/// highlight; if that commit is gone, the index is used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SmartlogSelection {
+    pub(crate) digest: CommitDigest,
+    pub(crate) index: usize,
+}
+
+impl SmartlogSelection {
+    pub(crate) fn at(view: &SmartlogView, index: usize) -> Option<SmartlogSelection> {
+        let commit = view.commits.get(index)?;
+        Some(SmartlogSelection {
+            digest: commit.node.clone(),
+            index,
+        })
+    }
+
+    /// Index in `view` of this selection. Digest wins; otherwise the
+    /// stored index if it is still in range.
+    pub(crate) fn resolve(&self, view: &SmartlogView) -> Option<usize> {
+        for (i, commit) in view.commits.iter().enumerate() {
+            if commit.node == self.digest {
+                return Some(i);
+            }
+        }
+        if self.index < view.commits.len() {
+            return Some(self.index);
+        }
+        None
+    }
+}
 
 /// Paint smartlog rows in the `sl sl` layout: graph, then hash, age,
 /// author, bookmarks, and `#N`, with the description on the next row.
-pub(crate) fn smartlog_lines(
+pub(crate) fn render_lines(
     view: &SmartlogView,
-    selected: Option<usize>,
-    now_unix: i64,
+    selected: Option<&SmartlogSelection>,
+    now_unix: TimestampsSecs,
     terminal_bg: TerminalBg,
     width: Width,
 ) -> Vec<Line> {
+    let selected_index = match selected {
+        Some(sel) => sel.resolve(view),
+        None => None,
+    };
     let mut lines = Vec::new();
     for row in &view.rows {
         let commit = match row.commit {
             Some(index) => view.commits.get(index),
             None => None,
         };
-        let selected_row = match (selected, row.commit) {
+        let selected_row = match (selected_index, row.commit) {
             (Some(sel), Some(index)) => sel == index,
             _ => false,
         };
@@ -43,7 +80,7 @@ pub(crate) fn smartlog_lines(
                     continue;
                 };
                 line.push_styled(&row.graph, phase_style);
-                line.push_styled(&short_node(&c.node), phase_style);
+                line.push_styled(&short_node(&c.node.0), phase_style);
                 let age = format_age(c.date_unix, now_unix);
                 let mut meta = Style::plain();
                 meta.dim = true;
@@ -164,28 +201,29 @@ fn short_node(node: &str) -> String {
     s
 }
 
-fn format_age(ts: i64, now: i64) -> String {
-    if ts <= 0 {
+fn format_age(ts: TimestampsSecs, now: TimestampsSecs) -> String {
+    if ts.0 <= 0 {
         return String::new();
     }
-    if now < ts {
+    let age = now.saturating_sub(ts);
+    if age.is_negative() {
         return String::from("in the future");
     }
-    let secs = now - ts;
-    if secs < 60 {
-        return plural(secs, "second");
+    if age < jiff::SignedDuration::from_mins(1) {
+        return plural(age.as_secs(), "second");
     }
-    if secs < 3600 {
-        return plural(secs / 60, "minute");
+    if age < jiff::SignedDuration::from_hours(1) {
+        return plural(age.as_mins(), "minute");
     }
-    if secs < 48 * 3600 {
-        return plural(secs / 3600, "hour");
+    if age < jiff::SignedDuration::from_hours(48) {
+        return plural(age.as_hours(), "hour");
     }
-    if secs < 14 * 86400 {
-        return plural(secs / 86400, "day");
+    // 14 days of 24 hours. SignedDuration has no day unit.
+    if age < jiff::SignedDuration::from_hours(14 * 24) {
+        return plural(age.as_hours() / 24, "day");
     }
     // Fallback calendar date in UTC, YYYY-MM-DD.
-    format_utc_date(ts)
+    format_utc_date(ts.0)
 }
 
 fn plural(n: i64, unit: &str) -> String {
@@ -256,36 +294,33 @@ pub(crate) fn commit_header_row(view: &SmartlogView, commit: usize) -> usize {
     0
 }
 
-pub(crate) fn unix_now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::repo::sl_smartlog::Forge;
+    use crate::repo::digest::CommitDigest;
+    use crate::repo::forge::Forge;
     use crate::repo::sl_smartlog::SmartlogCommit;
     use crate::repo::sl_smartlog::SmartlogRow;
     use crate::repo::sl_smartlog::SmartlogRowKind;
     use crate::repo::sl_smartlog::SmartlogView;
-    use crate::smartlog::smartlog_lines;
+    use crate::smartlog::SmartlogSelection;
+    use crate::smartlog::format_age;
+    use crate::smartlog::render_lines;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
+    use crate::util::time::ts_secs::TimestampsSecs;
 
     #[test]
     fn test_smartlog_pr_label_is_linked_hash_number() {
         let view = SmartlogView {
             commits: vec![SmartlogCommit {
-                node: String::from("abc"),
+                node: CommitDigest(String::from("abc")),
                 parents: Vec::new(),
                 phase: String::from("draft"),
                 bookmarks: Vec::new(),
                 desc: String::from("d"),
                 github_pr: Some(2032111),
                 author: String::from("t"),
-                date_unix: 0,
+                date_unix: TimestampsSecs(0),
                 current: false,
             }],
             rows: vec![SmartlogRow {
@@ -298,7 +333,7 @@ mod tests {
                 name: String::from("xai"),
             }),
         };
-        let lines = smartlog_lines(&view, None, 0, TerminalBg::Dark, Width(80));
+        let lines = render_lines(&view, None, TimestampsSecs(0), TerminalBg::Dark, Width(80));
         let text = lines[0].plain_text();
         assert_eq!(true, text.contains("#2032111"));
         assert_eq!(false, text.contains("gh#"));
@@ -320,14 +355,14 @@ mod tests {
     fn test_smartlog_selected_rows_fill_width() {
         let view = SmartlogView {
             commits: vec![SmartlogCommit {
-                node: String::from("abc"),
+                node: CommitDigest(String::from("abc")),
                 parents: Vec::new(),
                 phase: String::from("draft"),
                 bookmarks: Vec::new(),
                 desc: String::from("d"),
                 github_pr: None,
                 author: String::from("t"),
-                date_unix: 0,
+                date_unix: TimestampsSecs(0),
                 current: true,
             }],
             rows: vec![
@@ -345,16 +380,97 @@ mod tests {
             forge: None,
         };
         let width = Width(40);
-        let lines = smartlog_lines(&view, Some(0), 0, TerminalBg::Dark, width);
+        let sel = SmartlogSelection {
+            digest: CommitDigest(String::from("abc")),
+            index: 0,
+        };
+        let lines = render_lines(
+            &view,
+            Some(&sel),
+            TimestampsSecs(0),
+            TerminalBg::Dark,
+            width,
+        );
         assert_eq!(2, lines.len());
         assert_eq!(width, lines[0].width());
         assert_eq!(width, lines[1].width());
         assert_eq!(true, lines[0].fill_eol);
         assert_eq!(true, lines[1].fill_eol);
-        let unselected = smartlog_lines(&view, None, 0, TerminalBg::Dark, width);
+        let unselected = render_lines(&view, None, TimestampsSecs(0), TerminalBg::Dark, width);
         assert_eq!(true, unselected[0].width().0 < width.0);
         assert_eq!(true, unselected[1].width().0 < width.0);
         assert_eq!(false, unselected[0].fill_eol);
         assert_eq!(false, unselected[1].fill_eol);
+    }
+
+    #[test]
+    fn test_format_age_uses_signed_duration_units() {
+        assert_eq!(
+            "in the future",
+            format_age(TimestampsSecs(100), TimestampsSecs(50))
+        );
+        assert_eq!(
+            "5 seconds ago",
+            format_age(TimestampsSecs(100), TimestampsSecs(105))
+        );
+        assert_eq!(
+            "2 minutes ago",
+            format_age(TimestampsSecs(100), TimestampsSecs(100 + 120))
+        );
+        assert_eq!(
+            "3 hours ago",
+            format_age(TimestampsSecs(100), TimestampsSecs(100 + 3 * 3600))
+        );
+        assert_eq!(
+            "2 days ago",
+            format_age(TimestampsSecs(100), TimestampsSecs(100 + 2 * 86400))
+        );
+        assert_eq!("", format_age(TimestampsSecs(0), TimestampsSecs(100)));
+    }
+
+    #[test]
+    fn test_smartlog_selection_matches_digest_then_index() {
+        let mut view = SmartlogView {
+            commits: vec![
+                SmartlogCommit {
+                    node: CommitDigest(String::from("new")),
+                    parents: Vec::new(),
+                    phase: String::from("draft"),
+                    bookmarks: Vec::new(),
+                    desc: String::from("n"),
+                    github_pr: None,
+                    author: String::from("t"),
+                    date_unix: TimestampsSecs(0),
+                    current: true,
+                },
+                SmartlogCommit {
+                    node: CommitDigest(String::from("old")),
+                    parents: Vec::new(),
+                    phase: String::from("draft"),
+                    bookmarks: Vec::new(),
+                    desc: String::from("o"),
+                    github_pr: None,
+                    author: String::from("t"),
+                    date_unix: TimestampsSecs(0),
+                    current: false,
+                },
+            ],
+            rows: Vec::new(),
+            forge: None,
+        };
+        // Selected "old" at index 0 before "new" landed on top.
+        let sel = SmartlogSelection {
+            digest: CommitDigest(String::from("old")),
+            index: 0,
+        };
+        assert_eq!(Some(1), sel.resolve(&view));
+        // Digest gone: fall back to the stored index.
+        let gone = SmartlogSelection {
+            digest: CommitDigest(String::from("missing")),
+            index: 1,
+        };
+        assert_eq!(Some(1), gone.resolve(&view));
+        view.commits.clear();
+        assert_eq!(None, gone.resolve(&view));
     }
 }

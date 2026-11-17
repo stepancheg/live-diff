@@ -248,7 +248,6 @@ impl Search {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::height::Height;
     use crate::render::Renderer;
     use crate::search::find::SearchOutcome;
     use crate::search::find::search_next;
@@ -256,8 +255,9 @@ mod tests {
     use crate::search::state::CaseMode;
     use crate::search::state::Search;
     use crate::search::state::status_after_output;
-    use crate::size::Size;
+    use crate::terminal::height::Height;
     use crate::terminal::parse::parse_command_output;
+    use crate::terminal::size::Size;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
 

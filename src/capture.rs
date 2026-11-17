@@ -18,11 +18,11 @@ use tokio::sync::mpsc::Sender;
 
 use crate::diff::DiffOutput;
 use crate::diff::parse_diff;
-use crate::notify_pair::NotifyRx;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::command_for_tool;
 use crate::repo::repo::parse_untracked_paths;
 use crate::repo::repo::untracked_command_for_tool;
+use crate::util::notify_pair::NotifyRx;
 
 /// Result of a capture that may be cut short by `interrupt`.
 pub(crate) enum CaptureOutcome {
@@ -36,7 +36,7 @@ pub(crate) enum CaptureOutcome {
 /// Run `command` and return its combined stdout and stderr bytes.
 /// A notification on `interrupt` kills the child and returns
 /// [`CaptureOutcome::Interrupted`].
-pub(crate) async fn capture_command_output_interruptible(
+async fn capture_command_output_interruptible(
     command: &[String],
     interrupt: Option<&NotifyRx>,
 ) -> anyhow::Result<CaptureOutcome> {
@@ -272,7 +272,7 @@ impl CaptureSpec {
         }
     }
 
-    pub(crate) fn is_live(&self) -> bool {
+    fn is_live(&self) -> bool {
         match self {
             CaptureSpec::Live { .. } => true,
             CaptureSpec::Commit { .. } => false,
@@ -701,7 +701,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_interrupt_kills_hung_command() {
-        use crate::notify_pair::NotifyTx;
+        use crate::util::notify_pair::NotifyTx;
 
         let (tx, rx) = NotifyTx::pair();
         let command = [String::from("sleep"), String::from("30")];

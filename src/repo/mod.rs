@@ -1,3 +1,5 @@
+pub(crate) mod digest;
+pub(crate) mod forge;
 mod git;
 pub(crate) mod repo;
 mod sl;

@@ -24,6 +24,8 @@ Navigation
   q              Quit
   j, Down, Enter Scroll down
   k, Up          Scroll up
+  ^e             Scroll down, cursor stays
+  ^y             Scroll up, cursor stays
   Space, PgDn    Page down
   PgUp           Page up
   g, Home        Top
@@ -51,10 +53,10 @@ pub(crate) fn help_lines() -> Vec<Line> {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::height::Height;
     use crate::help::help_lines;
     use crate::render::Renderer;
-    use crate::size::Size;
+    use crate::terminal::height::Height;
+    use crate::terminal::size::Size;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
 
@@ -94,6 +96,14 @@ mod tests {
         assert_eq!(
             true,
             text.contains("?              Regex search backward from the bottom of the screen")
+        );
+        assert_eq!(
+            true,
+            text.contains("^e             Scroll down, cursor stays")
+        );
+        assert_eq!(
+            true,
+            text.contains("^y             Scroll up, cursor stays")
         );
         assert_eq!(true, text.contains("g, Home        Top"));
         assert_eq!(true, text.contains("G, End         Bottom"));

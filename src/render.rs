@@ -14,11 +14,11 @@ use crate::diff::DiffOutput;
 use crate::diff::FileHeaderSpan;
 use crate::diff::FileKey;
 use crate::diff::file_header_index;
-use crate::height::Height;
 use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
-use crate::size::Size;
+use crate::terminal::height::Height;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
+use crate::terminal::size::Size;
 use crate::terminal::width::Width;
 use crate::terminal_bg::TerminalBg;
 use crate::theme::search_highlight;
@@ -1223,7 +1223,7 @@ fn status_bar_fingerprint(
 /// label to its left does not shift while scrolling.
 /// `top` is the first visible row, `end` is one past the last visible
 /// row, and `total` is the number of wrapped rows.
-pub(crate) fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
+fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
     if total == 0 || end >= total {
         return String::from("Bot");
     }
@@ -1681,7 +1681,6 @@ mod tests {
     use std::cmp;
     use std::num::NonZeroU16;
 
-    use crate::height::Height;
     use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
     use crate::lines_with_wrapped_row_count::line_visual_row_count;
     use crate::render::Renderer;
@@ -1689,9 +1688,10 @@ mod tests {
     use crate::render::row_fingerprint;
     use crate::render::viewport_ruler;
     use crate::render::visual_rows_in_range;
-    use crate::size::Size;
     use crate::terminal::color::TerminalColor;
+    use crate::terminal::height::Height;
     use crate::terminal::parse::parse_command_output;
+    use crate::terminal::size::Size;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
     use crate::theme::NVIM_DARK_GREY1;

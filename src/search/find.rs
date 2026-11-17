@@ -22,7 +22,7 @@ pub(crate) struct Occurrence {
 /// Fresh search from the screen edge, or a repeat from the last match.
 /// `repeat` continues from the last hit. `forward` is the direction of this
 /// jump; the stored direction is updated only by the caller.
-pub(crate) fn run_search(
+fn run_search(
     renderer: &mut Renderer,
     search: &mut Search,
     forward: bool,
@@ -160,7 +160,7 @@ fn pos_before(line: usize, byte: usize, cur_line: usize, cur_byte: usize) -> boo
 }
 
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn find_forward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
+fn find_forward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
     if pattern.is_empty() {
         return None;
     }
@@ -173,7 +173,7 @@ pub(crate) fn find_forward(lines: &[Line], pattern: &str, start: usize) -> Optio
 }
 
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn find_backward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
+fn find_backward(lines: &[Line], pattern: &str, start: usize) -> Option<usize> {
     if pattern.is_empty() || lines.is_empty() {
         return None;
     }
@@ -206,7 +206,6 @@ fn line_contains(line: &Line, pattern: &str) -> bool {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::height::Height;
     use crate::render::Renderer;
     use crate::search::find::SearchOutcome;
     use crate::search::find::find_backward;
@@ -214,9 +213,10 @@ mod tests {
     use crate::search::find::search_next;
     use crate::search::find::submit_prompt;
     use crate::search::state::Search;
-    use crate::size::Size;
     use crate::terminal::color::TerminalColor;
+    use crate::terminal::height::Height;
     use crate::terminal::parse::parse_command_output;
+    use crate::terminal::size::Size;
     use crate::terminal::width::Width;
     use crate::terminal_bg::TerminalBg;
     use crate::theme::NVIM_LIGHT_YELLOW;

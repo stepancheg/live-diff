@@ -22,7 +22,7 @@ impl Default for TerminalBg {
 
 impl TerminalBg {
     /// Background for the status bar: light grey on white, dark grey on black.
-    pub(crate) fn highlight_color(self) -> Color {
+    fn highlight_color(self) -> Color {
         match self {
             TerminalBg::Light => Color::Grey,
             TerminalBg::Dark => Color::DarkGrey,
