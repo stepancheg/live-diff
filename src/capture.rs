@@ -328,13 +328,21 @@ pub(crate) async fn capture_command_output_loop(
     // not list untracked files. `u`/`U` and `r` still re-run via
     // `refresh`. The spec can change under `d`; re-read it each run.
     let mut cached: Option<CachedSnapshot> = None;
+    // An explicit refresh (mode switch, `r`, context change) may have
+    // replaced the on-screen diff with a loading line. The next
+    // completed snapshot must be sent even when the bytes match the
+    // cache; otherwise that loading line never clears.
+    let mut force_send = false;
     loop {
         let spec = shared_spec.lock().unwrap().clone();
         let live = spec.is_live();
         let command = spec.command(context.load(Ordering::SeqCst));
         let outcome = capture_command_output_interruptible(&command, Some(&refresh)).await;
         let diff = match outcome {
-            Ok(CaptureOutcome::Interrupted) => continue,
+            Ok(CaptureOutcome::Interrupted) => {
+                force_send = true;
+                continue;
+            }
             Ok(CaptureOutcome::Done { bytes, .. }) => CachedDiff::Bytes(bytes),
             Err(err) => {
                 let text = format!("error: {err:?}");
@@ -347,7 +355,10 @@ pub(crate) async fn capture_command_output_loop(
             CaptureSpec::Live { tool, .. } => {
                 let untracked_cmd = untracked_command_for_tool(*tool);
                 match capture_stdout_interruptible(&untracked_cmd, Some(&refresh)).await {
-                    Ok(CaptureOutcome::Interrupted) => continue,
+                    Ok(CaptureOutcome::Interrupted) => {
+                        force_send = true;
+                        continue;
+                    }
                     Ok(CaptureOutcome::Done { bytes, success }) => {
                         if success {
                             CachedUntracked::Ok(bytes)
@@ -372,8 +383,16 @@ pub(crate) async fn capture_command_output_loop(
             None => false,
         };
         if unchanged {
-            // Same diff bytes and same untracked listing: keep the
-            // previous DiffOutput and do not notify the UI.
+            if force_send {
+                if let Some(prev) = &cached {
+                    if tx.send(prev.output.clone()).await.is_err() {
+                        return;
+                    }
+                }
+                force_send = false;
+            }
+            // Same bytes: reuse the cached DiffOutput. A forced send
+            // still delivers it so a loading placeholder can clear.
         } else {
             let output = match &cached {
                 Some(prev) if prev.diff == diff => {
@@ -398,15 +417,19 @@ pub(crate) async fn capture_command_output_loop(
             if tx.send(output).await.is_err() {
                 return;
             }
+            force_send = false;
         }
         if live {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
-                () = refresh.notified() => {}
+                () = refresh.notified() => {
+                    force_send = true;
+                }
             }
         } else {
             // Commit mode: wait for an explicit refresh only.
             refresh.notified().await;
+            force_send = true;
         }
     }
 }

@@ -838,6 +838,12 @@ impl EventLoop {
         self.sync_status_mode();
         self.mode = Mode::Output;
         self.search.clear_match();
+        // Drop the previous diff immediately. The capture for the new
+        // mode has not finished yet.
+        let loading = DiffOutput::message(&format!("loading {}", kind.label()));
+        self.output = loading.clone();
+        self.renderer.set_diff(loading);
+        self.renderer.set_status_note(None);
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
