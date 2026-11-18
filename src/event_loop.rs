@@ -1107,10 +1107,12 @@ impl EventLoop {
         };
         {
             let mut spec = self.spec.lock().unwrap();
-            // `@` is the working-copy parent: show the default working
-            // tree diff, not `show` of that commit.
+            // `@` is the working-copy parent (the current PR). Show
+            // the working copy against the previous commit, not the
+            // default `diff -r .` (uncommitted changes only) and not
+            // `show` of that commit.
             if is_current {
-                *spec = CaptureSpec::for_kind(tool, DiffViewKind::Default);
+                *spec = CaptureSpec::for_kind(tool, DiffViewKind::RevPrev);
             } else {
                 *spec = CaptureSpec::Commit { tool, commit: node };
             }
