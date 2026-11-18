@@ -181,7 +181,7 @@ pub(crate) const DIFF_VIEW_KINDS: [DiffViewKind; 3] = [
 impl DiffViewKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            DiffViewKind::Default => "default diff",
+            DiffViewKind::Default => "diff -r .",
             DiffViewKind::ChangeCurrent => "diff -c .",
             DiffViewKind::RevPrev => "diff -r prev",
         }
@@ -298,7 +298,7 @@ impl CaptureSpec {
                 DiffTool::Git => format!("show {commit}"),
             },
             CaptureSpec::Fixed { command } => fixed_command_status(command),
-            CaptureSpec::Live { rev: None, .. } => String::from("default diff"),
+            CaptureSpec::Live { rev: None, .. } => String::from("diff -r ."),
         }
     }
 
@@ -524,7 +524,7 @@ mod tests {
         use crate::capture::DiffViewKind;
         use crate::repo::repo::DiffTool;
 
-        assert_eq!("default diff", DiffViewKind::Default.label());
+        assert_eq!("diff -r .", DiffViewKind::Default.label());
         assert_eq!("diff -c .", DiffViewKind::ChangeCurrent.label());
         assert_eq!("diff -r prev", DiffViewKind::RevPrev.label());
 
@@ -608,7 +608,7 @@ mod tests {
         );
         assert_eq!(Some(DiffViewKind::RevPrev), git_prev.view_kind());
 
-        assert_eq!("default diff", sl_default.mode_status());
+        assert_eq!("diff -r .", sl_default.mode_status());
         assert_eq!("diff -c .", sl_change.mode_status());
         assert_eq!("diff -r prev", sl_prev.mode_status());
         assert_eq!("diff -c .", git_change.mode_status());

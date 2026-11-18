@@ -1655,7 +1655,7 @@ mod tests {
     fn test_diff_mode_lines_mark_current_and_selection() {
         let lines = diff_mode_lines(1, Some(DiffViewKind::Default), TerminalBg::Dark);
         assert_eq!(3, lines.len());
-        assert_eq!("  default diff  *", lines[0].plain_text());
+        assert_eq!("  diff -r .  *", lines[0].plain_text());
         assert_eq!("> diff -c .", lines[1].plain_text());
         assert_eq!("  diff -r prev", lines[2].plain_text());
     }

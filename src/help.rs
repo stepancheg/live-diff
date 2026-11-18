@@ -13,7 +13,7 @@ Mode switch
 
 In the diff mode list, j/k move, Enter selects, Esc or d returns.
 In smartlog, j/k move, Enter opens that commit (or the working-copy diff on @), Esc or t returns.
-Modes are the default diff, diff -c ., and diff -r prev
+Modes are diff -r ., diff -c ., and diff -r prev
 (git: default diff, show HEAD, diff HEAD^).
 In the diff stat, j/k move, Enter or s goes to the file, t opens smartlog, Esc returns, q quits.
 Untracked files are listed after the stat.
