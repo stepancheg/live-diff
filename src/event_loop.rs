@@ -67,6 +67,17 @@ enum KeyResult {
     Refresh,
 }
 
+/// How Enter / `c` / `v` on a smartlog row opens a diff.
+#[derive(Clone, Copy)]
+enum SmartlogOpen {
+    /// Enter: `-r prev` on `@`, otherwise `-c` that commit.
+    Enter,
+    /// `c`: `diff -c` that commit.
+    Change,
+    /// `v`: `diff -r` that commit.
+    Rev,
+}
+
 /// Where help returns when it closes.
 #[derive(Clone, Copy)]
 enum HelpBack {
@@ -1045,10 +1056,10 @@ impl EventLoop {
             self.help_renderer.terminal_bg(),
             self.size.width,
         );
-        let hint = "Enter: open";
+        let hint = smartlog_enter_hint(view, self.smartlog_sel.as_ref(), self.tool);
         if !force {
             let same_lines = self.help_renderer.lines() == lines.as_slice();
-            let same_label = self.help_renderer.status_label() == Some(hint);
+            let same_label = self.help_renderer.status_label() == Some(hint.as_str());
             if same_lines {
                 if same_label {
                     return Ok(());
@@ -1056,8 +1067,7 @@ impl EventLoop {
             }
         }
         self.help_renderer.set_lines(lines);
-        self.help_renderer
-            .set_status_label(Some(String::from(hint)));
+        self.help_renderer.set_status_label(Some(hint));
         if let Some(index) = self.smartlog_sel.as_ref().and_then(|sel| sel.resolve(view)) {
             let row = commit_header_row(view, index);
             self.help_renderer.ensure_line_visible(row);
@@ -1090,7 +1100,7 @@ impl EventLoop {
         sel.resolve(view)
     }
 
-    fn apply_smartlog_selection(&mut self) -> anyhow::Result<KeyResult> {
+    fn apply_smartlog_selection(&mut self, open: SmartlogOpen) -> anyhow::Result<KeyResult> {
         let Some(view) = &self.smartlog else {
             return self.close_smartlog();
         };
@@ -1100,27 +1110,47 @@ impl EventLoop {
         let Some(commit) = view.commits.get(index) else {
             return self.close_smartlog();
         };
-        let node = commit.node.0.clone();
+        // Top `@` is spelled `.`; every other row uses the full digest.
+        let rev = if index == 0 && commit.current {
+            String::from(".")
+        } else {
+            commit.node.0.clone()
+        };
         let is_current = commit.current;
         let Some(tool) = self.tool else {
             return self.close_smartlog();
         };
-        {
-            let mut spec = self.spec.lock().unwrap();
-            // `@` is the working-copy parent (the current PR). Show
-            // the working copy against the previous commit, not the
-            // default `diff -r .` (uncommitted changes only) and not
-            // `show` of that commit.
-            if is_current {
-                *spec = CaptureSpec::for_kind(tool, DiffViewKind::RevPrev);
-            } else {
-                *spec = CaptureSpec::Commit { tool, commit: node };
+        let spec = match open {
+            SmartlogOpen::Enter => {
+                // `@` is the working-copy parent (the current PR). Show
+                // the working copy against the previous commit, not the
+                // default `diff -r .` (uncommitted changes only) and not
+                // `show` of that commit.
+                if is_current {
+                    CaptureSpec::for_kind(tool, DiffViewKind::RevPrev)
+                } else {
+                    CaptureSpec::Commit { tool, commit: rev }
+                }
             }
+            SmartlogOpen::Change => CaptureSpec::Commit { tool, commit: rev },
+            SmartlogOpen::Rev => CaptureSpec::Live {
+                tool,
+                rev: Some(rev),
+            },
+        };
+        let loading_label = format!("loading {}", spec.mode_status());
+        {
+            let mut slot = self.spec.lock().unwrap();
+            *slot = spec;
         }
         self.sync_status_mode();
         self.smartlog_from_files = false;
         self.mode = Mode::Output;
         self.search.clear_match();
+        let loading = DiffOutput::message(&loading_label);
+        self.output = loading.clone();
+        self.renderer.set_diff(loading);
+        self.renderer.set_status_note(None);
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
@@ -1133,7 +1163,19 @@ impl EventLoop {
             return Ok(KeyResult::Continue);
         }
         if key.code == KeyCode::Enter {
-            return self.apply_smartlog_selection();
+            return self.apply_smartlog_selection(SmartlogOpen::Enter);
+        }
+        // `c` / `v` open -c / -r for the selected commit. `r` stays refresh.
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    return self.apply_smartlog_selection(SmartlogOpen::Change);
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return self.apply_smartlog_selection(SmartlogOpen::Rev);
+                }
+                _ => {}
+            }
         }
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
@@ -1434,6 +1476,44 @@ fn show_search_outcome(
     Ok(())
 }
 
+/// Status-bar text for Enter on the selected smartlog row: the diff
+/// that key opens. The hash is the 10-digit smartlog form so the
+/// label fits; the open itself still uses the full digest.
+fn smartlog_enter_hint(
+    view: &SmartlogView,
+    sel: Option<&SmartlogSelection>,
+    tool: Option<DiffTool>,
+) -> String {
+    let Some(tool) = tool else {
+        return String::from("Enter: open");
+    };
+    let Some(index) = sel.and_then(|sel| sel.resolve(view)) else {
+        return String::from("Enter: open");
+    };
+    let Some(commit) = view.commits.get(index) else {
+        return String::from("Enter: open");
+    };
+    let status = if commit.current {
+        CaptureSpec::for_kind(tool, DiffViewKind::RevPrev).mode_status()
+    } else {
+        let rev = smartlog_status_rev(&commit.node.0);
+        CaptureSpec::Commit {
+            tool,
+            commit: String::from(rev),
+        }
+        .mode_status()
+    };
+    format!("Enter: {status}")
+}
+
+/// Ten hex digits, the same width `sl sl` paints for a node.
+fn smartlog_status_rev(node: &str) -> &str {
+    match node.char_indices().nth(10) {
+        Some((i, _)) => &node[..i],
+        None => node,
+    }
+}
+
 /// Status-bar note for the diff view. Hidden when there are none.
 fn untracked_status_note(count: usize) -> Option<String> {
     if count == 0 {
@@ -1657,7 +1737,14 @@ fn key_action(key: &KeyEvent) -> Option<KeyAction> {
 mod tests {
     use crate::capture::DiffViewKind;
     use crate::event_loop::diff_mode_lines;
+    use crate::event_loop::smartlog_enter_hint;
+    use crate::repo::digest::CommitDigest;
+    use crate::repo::repo::DiffTool;
+    use crate::repo::sl::smartlog::SmartlogCommit;
+    use crate::repo::sl::smartlog::SmartlogView;
+    use crate::smartlog::SmartlogSelection;
     use crate::terminal_bg::TerminalBg;
+    use crate::util::time::ts_secs::TimestampsSecs;
 
     #[test]
     fn test_diff_mode_lines_mark_current_and_selection() {
@@ -1666,5 +1753,55 @@ mod tests {
         assert_eq!("  diff -r .  *", lines[0].plain_text());
         assert_eq!("> diff -c .", lines[1].plain_text());
         assert_eq!("  diff -r prev", lines[2].plain_text());
+    }
+
+    fn commit(node: &str, current: bool) -> SmartlogCommit {
+        SmartlogCommit {
+            node: CommitDigest(String::from(node)),
+            parents: Vec::new(),
+            phase: String::from("draft"),
+            bookmarks: Vec::new(),
+            desc: String::from("d"),
+            github_pr: None,
+            author: String::from("t"),
+            date_unix: TimestampsSecs(0),
+            current,
+        }
+    }
+
+    #[test]
+    fn test_smartlog_enter_hint_names_the_opened_diff() {
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        let view = SmartlogView {
+            commits: vec![commit(full, true)],
+            rows: Vec::new(),
+            forge: None,
+        };
+        let current = SmartlogSelection {
+            digest: CommitDigest(String::from(full)),
+            index: 0,
+        };
+        assert_eq!(
+            "Enter: diff -r prev",
+            smartlog_enter_hint(&view, Some(&current), Some(DiffTool::Sl))
+        );
+        let other_node = "abcdef0123456789abcdef0123456789abcdef01";
+        let other_view = SmartlogView {
+            commits: vec![commit(full, true), commit(other_node, false)],
+            rows: Vec::new(),
+            forge: None,
+        };
+        let other = SmartlogSelection {
+            digest: CommitDigest(String::from(other_node)),
+            index: 1,
+        };
+        assert_eq!(
+            "Enter: diff -c abcdef0123",
+            smartlog_enter_hint(&other_view, Some(&other), Some(DiffTool::Sl))
+        );
+        assert_eq!(
+            "Enter: open",
+            smartlog_enter_hint(&view, None, Some(DiffTool::Sl))
+        );
     }
 }

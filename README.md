@@ -79,7 +79,7 @@ or `bin/sl-tui`
 | `/` `?` `n` `N` | Search |
 | `s` | Diff stat (Enter or `s` opens the file, Esc returns) |
 | `d` | Diff mode: `-r .`, `-c .`, or `-r prev` |
-| `t` | Smartlog (Enter opens that commit, or `diff -r prev` on `@`; Esc returns) |
+| `t` | Smartlog (Enter opens that commit, or `diff -r prev` on `@`; `c`/`v` open `-c`/`-r` for that commit; Esc returns) |
 | `u` / `U` | Decrease / increase context |
 | `mx` / `'x` | Set / go to mark |
 
