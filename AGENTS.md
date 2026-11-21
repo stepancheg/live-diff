@@ -1,6 +1,8 @@
 - Use ASCII unless a non-ASCII character is required (for example a
   test of wide-character handling). No em dashes, en dashes, arrows,
   or other typographic Unicode in comments, docs, or scripts.
+- Wrap Markdown to 80 characters per line. A table row may run longer
+  when a cell cannot break across lines.
 - Use `cargo +nightly fmt` to format rust code
 - On commit, run `cargo +nightly fmt` when the change includes Rust
   code

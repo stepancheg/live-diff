@@ -1,6 +1,11 @@
+use std::collections::HashMap;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::repo::digest::CommitDigest;
+use crate::repo::pr_status::PrCheck;
+use crate::repo::pr_status::PrReview;
+use crate::repo::pr_status::PrStatus;
 use crate::repo::sl::smartlog::SmartlogCommit;
 use crate::repo::sl::smartlog::SmartlogRow;
 use crate::repo::sl::smartlog::SmartlogRowKind;
@@ -51,6 +56,7 @@ impl SmartlogSelection {
 pub(crate) fn render_lines(
     view: &SmartlogView,
     selected: Option<&SmartlogSelection>,
+    statuses: &HashMap<u64, PrStatus>,
     now_unix: TimestampsSecs,
     terminal_bg: TerminalBg,
     width: Width,
@@ -102,16 +108,25 @@ pub(crate) fn render_lines(
                 }
                 if let Some(pr) = c.github_pr {
                     // Spaces stay unlinked and not underlined; only `#N` is.
+                    // With a fetched status this matches `sl ssl`: `#N`,
+                    // the review word, and the CI glyph.
                     line.push_styled("  ", book);
-                    let mut pr_style = book;
-                    pr_style.underline = true;
-                    let label = format!("#{pr}");
-                    match &view.forge {
-                        Some(forge) => {
-                            line.push_linked(&label, pr_style, &forge.pull_url(pr));
+                    match statuses.get(&pr) {
+                        Some(status) => {
+                            push_pr_status(&mut line, pr, status, view, selected_row, terminal_bg);
                         }
                         None => {
-                            line.push_styled(&label, pr_style);
+                            let mut pr_style = book;
+                            pr_style.underline = true;
+                            let label = format!("#{pr}");
+                            match &view.forge {
+                                Some(forge) => {
+                                    line.push_linked(&label, pr_style, &forge.pull_url(pr));
+                                }
+                                None => {
+                                    line.push_styled(&label, pr_style);
+                                }
+                            }
                         }
                     }
                 }
@@ -154,6 +169,68 @@ pub(crate) fn render_lines(
         lines.push(line);
     }
     lines
+}
+
+/// `#N <status> <glyph>` in the ssl colors. `#N` keeps the PR link.
+fn push_pr_status(
+    line: &mut Line,
+    pr: u64,
+    status: &PrStatus,
+    view: &SmartlogView,
+    selected_row: bool,
+    terminal_bg: TerminalBg,
+) {
+    let mut review_style = Style::plain();
+    review_style.fg = Some(review_color(status.review));
+    review_style.bold = review_is_bold(status.review);
+    apply_row_bg(&mut review_style, selected_row, terminal_bg);
+    let mut link_style = review_style;
+    link_style.underline = true;
+    let label = format!("#{pr}");
+    match &view.forge {
+        Some(forge) => {
+            line.push_linked(&label, link_style, &forge.pull_url(pr));
+        }
+        None => {
+            line.push_styled(&label, link_style);
+        }
+    }
+    line.push_styled(" ", review_style);
+    line.push_styled(status.review_text(), review_style);
+    if let Some(glyph) = status.check_glyph() {
+        let mut signal = Style::plain();
+        signal.fg = Some(check_color(status.check));
+        apply_row_bg(&mut signal, selected_row, terminal_bg);
+        line.push_styled(" ", signal);
+        line.push_styled(glyph, signal);
+    }
+}
+
+fn review_color(review: PrReview) -> TerminalColor {
+    // Hex values are the truecolor forms of `ssl.*` in Sapling.
+    match review {
+        PrReview::Closed | PrReview::Merged => TerminalColor::Cyan,
+        PrReview::Approved => TerminalColor::BrightGreen,
+        PrReview::ChangesRequested => TerminalColor::Rgb(242, 19, 149),
+        PrReview::ReviewRequired => TerminalColor::Rgb(247, 146, 59),
+        PrReview::Unreviewed => TerminalColor::Rgb(141, 148, 158),
+    }
+}
+
+fn review_is_bold(review: PrReview) -> bool {
+    match review {
+        PrReview::Approved | PrReview::ChangesRequested | PrReview::ReviewRequired => true,
+        PrReview::Closed | PrReview::Merged | PrReview::Unreviewed => false,
+    }
+}
+
+fn check_color(check: Option<PrCheck>) -> TerminalColor {
+    match check {
+        Some(PrCheck::Ok) => TerminalColor::Green,
+        Some(PrCheck::Pending) => TerminalColor::Cyan,
+        Some(PrCheck::Failed) => TerminalColor::Red,
+        None => TerminalColor::White,
+    }
 }
 
 fn row_header_graph(view: &SmartlogView, commit: &SmartlogCommit, _row: &SmartlogRow) -> String {
@@ -296,8 +373,13 @@ pub(crate) fn commit_header_row(view: &SmartlogView, commit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::repo::digest::CommitDigest;
     use crate::repo::forge::Forge;
+    use crate::repo::pr_status::PrCheck;
+    use crate::repo::pr_status::PrReview;
+    use crate::repo::pr_status::PrStatus;
     use crate::repo::sl::smartlog::SmartlogCommit;
     use crate::repo::sl::smartlog::SmartlogRow;
     use crate::repo::sl::smartlog::SmartlogRowKind;
@@ -333,7 +415,14 @@ mod tests {
                 name: String::from("xai"),
             }),
         };
-        let lines = render_lines(&view, None, TimestampsSecs(0), TerminalBg::Dark, Width(80));
+        let lines = render_lines(
+            &view,
+            None,
+            &HashMap::new(),
+            TimestampsSecs(0),
+            TerminalBg::Dark,
+            Width(80),
+        );
         let text = lines[0].plain_text();
         assert_eq!(true, text.contains("#2032111"));
         assert_eq!(false, text.contains("gh#"));
@@ -349,6 +438,50 @@ mod tests {
             linked.link.clone()
         );
         assert_eq!("#2032111", linked.content.as_ref().as_str());
+    }
+
+    #[test]
+    fn test_smartlog_pr_status_matches_ssl_wording() {
+        let view = SmartlogView {
+            commits: vec![SmartlogCommit {
+                node: CommitDigest(String::from("abc")),
+                parents: Vec::new(),
+                phase: String::from("draft"),
+                bookmarks: Vec::new(),
+                desc: String::from("d"),
+                github_pr: Some(12),
+                author: String::from("t"),
+                date_unix: TimestampsSecs(0),
+                current: false,
+            }],
+            rows: vec![SmartlogRow {
+                commit: Some(0),
+                graph: String::from("o  "),
+                kind: SmartlogRowKind::Header,
+            }],
+            forge: Some(Forge::GitHub {
+                owner: String::from("o"),
+                repo: String::from("r"),
+            }),
+        };
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            12,
+            PrStatus {
+                review: PrReview::Approved,
+                check: Some(PrCheck::Ok),
+            },
+        );
+        let lines = render_lines(
+            &view,
+            None,
+            &statuses,
+            TimestampsSecs(0),
+            TerminalBg::Dark,
+            Width(80),
+        );
+        let text = lines[0].plain_text();
+        assert_eq!(true, text.contains("#12 Approved \u{2713}"));
     }
 
     #[test]
@@ -387,6 +520,7 @@ mod tests {
         let lines = render_lines(
             &view,
             Some(&sel),
+            &HashMap::new(),
             TimestampsSecs(0),
             TerminalBg::Dark,
             width,
@@ -396,7 +530,14 @@ mod tests {
         assert_eq!(width, lines[1].width());
         assert_eq!(true, lines[0].fill_eol);
         assert_eq!(true, lines[1].fill_eol);
-        let unselected = render_lines(&view, None, TimestampsSecs(0), TerminalBg::Dark, width);
+        let unselected = render_lines(
+            &view,
+            None,
+            &HashMap::new(),
+            TimestampsSecs(0),
+            TerminalBg::Dark,
+            width,
+        );
         assert_eq!(true, unselected[0].width().0 < width.0);
         assert_eq!(true, unselected[1].width().0 < width.0);
         assert_eq!(false, unselected[0].fill_eol);

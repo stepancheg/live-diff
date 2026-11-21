@@ -14,7 +14,9 @@ Mode switch
 In the diff mode list, j/k move, Enter selects, Esc or d returns.
 In smartlog, j/k move, Enter opens that commit (or diff -r prev on @).
 c opens diff -c and v opens diff -r for that commit (. if it is the top @).
-The tree is re-queried on the diff interval; r re-queries now. Esc or t returns.
+The tree is re-queried on the diff interval; r re-queries now.
+PR review and CI status load in the background (GitHub and Origin).
+Esc or t returns.
 Modes are diff -r ., diff -c ., and diff -r prev
 (git: default diff, show HEAD, diff HEAD^).
 In the diff stat, j/k move, Enter or s goes to the file, t opens smartlog, Esc returns, q quits.

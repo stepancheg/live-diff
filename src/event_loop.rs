@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future;
 use std::io;
 use std::mem;
@@ -7,16 +8,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::capture::CaptureSpec;
@@ -29,12 +29,18 @@ use crate::diff::file_list_lines;
 use crate::help::help_lines;
 use crate::render::Renderer;
 use crate::render::ScrollAnchor;
+use crate::repo::forge::Forge;
+use crate::repo::pr_status::PR_STATUS_REFRESH;
+use crate::repo::pr_status::PrStatus;
+use crate::repo::pr_status_actor::PrStatusBatch;
+use crate::repo::pr_status_actor::PrStatusJob;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::step_context;
 use crate::repo::sl::smartlog::SmartlogView;
 use crate::repo::sl::smartlog::current_commit_index;
 use crate::repo::sl::smartlog::fetch_smartlog;
 use crate::repo::sl::smartlog::find_commit_index;
+use crate::repo::sl::smartlog_actor::SmartlogPollMsg;
 use crate::search::find::SearchOutcome;
 use crate::search::find::search_next;
 use crate::search::find::submit_prompt;
@@ -63,7 +69,6 @@ use crate::theme::diff_note_style;
 use crate::util::mark::MarkOp;
 use crate::util::mark::Marks;
 use crate::util::mark::NOT_SET;
-use crate::util::notify_pair::NotifyRx;
 use crate::util::notify_pair::NotifyTx;
 use crate::util::time::ts_secs::TimestampsSecs;
 
@@ -158,7 +163,11 @@ pub(crate) struct EventLoop {
     /// cannot overwrite a newer `r` / open result.
     smartlog_epoch: Arc<AtomicU64>,
     smartlog_wake_tx: NotifyTx,
-    smartlog_wake_rx: Option<NotifyRx>,
+    /// Review/CI status for smartlog `#N` links. Filled in the
+    /// background; the tree paints `#N` alone until a result arrives.
+    pr_statuses: HashMap<u64, PrStatus>,
+    pr_status_forge: Option<Forge>,
+    pr_status_tx: UnboundedSender<PrStatusJob>,
 }
 
 impl EventLoop {
@@ -170,8 +179,11 @@ impl EventLoop {
         spec: Arc<Mutex<CaptureSpec>>,
         tool: Option<DiffTool>,
         start_view: StartView,
+        smartlog_live: Arc<AtomicBool>,
+        smartlog_epoch: Arc<AtomicU64>,
+        smartlog_wake_tx: NotifyTx,
+        pr_status_tx: UnboundedSender<PrStatusJob>,
     ) -> EventLoop {
-        let (smartlog_wake_tx, smartlog_wake_rx) = NotifyTx::pair();
         EventLoop {
             renderer: Renderer::new(terminal_bg, size),
             help_renderer: Renderer::new(terminal_bg, size),
@@ -190,65 +202,58 @@ impl EventLoop {
             smartlog_sel: None,
             smartlog_from_files: false,
             start_view,
-            smartlog_live: Arc::new(AtomicBool::new(false)),
-            smartlog_epoch: Arc::new(AtomicU64::new(0)),
+            smartlog_live,
+            smartlog_epoch,
             smartlog_wake_tx,
-            smartlog_wake_rx: Some(smartlog_wake_rx),
+            pr_statuses: HashMap::new(),
+            pr_status_forge: None,
+            pr_status_tx,
         }
     }
 
     pub(crate) async fn run(
-        &mut self,
+        mut self,
         first_lines: DiffOutput,
         output_rx: Receiver<DiffOutput>,
         keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
-        interval: Duration,
+        smartlog_rx: Option<Receiver<SmartlogPollMsg>>,
+        pr_result_rx: Receiver<PrStatusBatch>,
     ) -> anyhow::Result<()> {
         let result = self
-            .drive(
+            .run_loop(
                 first_lines,
                 output_rx,
                 keys,
                 refresh_tx,
                 capture_task,
-                interval,
+                smartlog_rx,
+                pr_result_rx,
             )
             .await;
         self.history.shutdown().await;
         result
     }
 
-    async fn drive(
+    async fn run_loop(
         &mut self,
         first_lines: DiffOutput,
         mut output_rx: Receiver<DiffOutput>,
         mut keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
-        interval: Duration,
+        mut smartlog_rx: Option<Receiver<SmartlogPollMsg>>,
+        mut pr_result_rx: Receiver<PrStatusBatch>,
     ) -> anyhow::Result<()> {
-        let mut smartlog_rx = None;
-        let _smartlog_task = match mem::take(&mut self.smartlog_wake_rx) {
-            Some(wake) if self.tool == Some(DiffTool::Sl) => {
-                let (tx, rx) = mpsc::channel(1);
-                smartlog_rx = Some(rx);
-                Some(AbortOnDropHandle::new(tokio::spawn(smartlog_poll_loop(
-                    Arc::clone(&self.smartlog_live),
-                    Arc::clone(&self.smartlog_epoch),
-                    wake,
-                    interval,
-                    tx,
-                ))))
-            }
-            wake => {
-                self.smartlog_wake_rx = wake;
-                None
-            }
-        };
-        self.on_command_output(first_lines)?;
-        self.open_start_view()?;
+        let mut pr_status_tick = tokio::time::interval(PR_STATUS_REFRESH);
+        pr_status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick is immediate; open_smartlog requests the
+        // first fetch itself.
+        pr_status_tick.tick().await;
+        let mut out = io::stdout();
+        self.on_command_output(first_lines, &mut out)?;
+        self.open_start_view(&mut out)?;
         loop {
             tokio::select! {
                 msg = output_rx.recv() => {
@@ -257,14 +262,25 @@ impl EventLoop {
                         capture_task.await?;
                         return Ok(());
                     };
-                    self.on_command_output(output)?;
+                    self.on_command_output(output, &mut out)?;
                 }
                 poll = recv_smartlog_poll(&mut smartlog_rx) => {
                     match poll {
-                        Some(msg) => self.on_smartlog_poll(msg)?,
+                        Some(msg) => self.on_smartlog_poll(msg, &mut out)?,
                         None => {
                             smartlog_rx = None;
                         }
+                    }
+                }
+                result = pr_result_rx.recv() => {
+                    match result {
+                        Some(batch) => self.on_pr_statuses(batch, &mut out)?,
+                        None => {}
+                    }
+                }
+                _ = pr_status_tick.tick() => {
+                    if self.smartlog_live.load(Ordering::SeqCst) {
+                        self.request_pr_statuses();
                     }
                 }
                 event = keys.recv() => {
@@ -273,7 +289,7 @@ impl EventLoop {
                     };
                     match event? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            match self.on_key(key)? {
+                            match self.on_key(key, &mut out)? {
                                 KeyResult::Continue => {}
                                 KeyResult::Quit => {
                                     // `capture_task` and the key reader abort on drop.
@@ -287,10 +303,10 @@ impl EventLoop {
                             }
                         }
                         Event::Resize(cols, rows) => {
-                            self.on_resize(cols, rows)?;
+                            self.on_resize(cols, rows, &mut out)?;
                         }
                         Event::Paste(text) => {
-                            self.on_paste(&text)?;
+                            self.on_paste(&text, &mut out)?;
                         }
                         _ => {}
                     }
@@ -299,7 +315,7 @@ impl EventLoop {
         }
     }
 
-    fn on_resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+    fn on_resize(&mut self, cols: u16, rows: u16, out: &mut io::Stdout) -> anyhow::Result<()> {
         self.size = Size {
             width: Width(u32::from(cols)),
             height: Height(u32::from(rows)),
@@ -308,10 +324,10 @@ impl EventLoop {
         self.help_renderer.update_size(self.size);
         match self.mode {
             Mode::Help { .. } | Mode::Files | Mode::DiffSelect | Mode::Smartlog => {
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
             }
             _ => {
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
         }
         Ok(())
@@ -322,7 +338,11 @@ impl EventLoop {
         self.search.resume_from_history(entries);
     }
 
-    fn on_command_output(&mut self, output: DiffOutput) -> anyhow::Result<()> {
+    fn on_command_output(
+        &mut self,
+        output: DiffOutput,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<()> {
         let anchor = self.search.anchor(self.renderer.lines());
         let mark_anchors: Vec<(char, ScrollAnchor)> = self
             .marks
@@ -354,28 +374,28 @@ impl EventLoop {
             Mode::Help { .. } | Mode::DiffSelect | Mode::Smartlog => {}
             // In-place refresh. `draw` skips the terminal write when the
             // visible list is unchanged, so a text selection survives.
-            Mode::Files => self.paint_file_list(false)?,
+            Mode::Files => self.paint_file_list(false, out)?,
             _ => {
                 // The start view replaces this frame; do not flash the diff.
                 if self.start_view == StartView::Diff {
-                    self.renderer.draw(&mut io::stdout())?;
+                    self.renderer.draw(out)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn open_start_view(&mut self) -> anyhow::Result<()> {
+    fn open_start_view(&mut self, out: &mut io::Stdout) -> anyhow::Result<()> {
         let start = self.start_view;
         self.start_view = StartView::Diff;
         match start {
             StartView::Diff => Ok(()),
             StartView::Stat => {
-                self.open_file_list()?;
+                self.open_file_list(out)?;
                 Ok(())
             }
             StartView::Tree => {
-                self.open_smartlog()?;
+                self.open_smartlog(out)?;
                 if matches!(self.mode, Mode::Smartlog) {
                     return Ok(());
                 }
@@ -387,26 +407,26 @@ impl EventLoop {
         }
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         match &self.mode {
             Mode::Prompt(_) => {
-                self.on_prompt_key(key)?;
+                self.on_prompt_key(key, out)?;
                 Ok(KeyResult::Continue)
             }
-            Mode::Dash => self.on_dash_key(key),
+            Mode::Dash => self.on_dash_key(key, out),
             Mode::Mark(op) => {
                 let op = *op;
-                self.on_mark_key(key, op)
+                self.on_mark_key(key, op, out)
             }
-            Mode::Help { .. } => self.on_help_key(key),
-            Mode::Files => self.on_files_key(key),
-            Mode::DiffSelect => self.on_diff_select_key(key),
-            Mode::Smartlog => self.on_smartlog_key(key),
-            Mode::Output => self.on_output_key(key),
+            Mode::Help { .. } => self.on_help_key(key, out),
+            Mode::Files => self.on_files_key(key, out),
+            Mode::DiffSelect => self.on_diff_select_key(key, out),
+            Mode::Smartlog => self.on_smartlog_key(key, out),
+            Mode::Output => self.on_output_key(key, out),
         }
     }
 
-    fn on_dash_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_dash_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
         let option = match key.code {
             KeyCode::Char('i') if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
@@ -431,17 +451,17 @@ impl EventLoop {
                 .case_mode()
                 .status(self.search.match_label(self.renderer.lines()).as_deref());
             self.renderer.set_status_label(Some(status));
-            self.renderer.redraw(&mut io::stdout())?;
+            self.renderer.redraw(out)?;
             return Ok(KeyResult::Continue);
         }
         // Unknown option or cancel: drop the `-` prompt.
         let label = self.search.match_label(self.renderer.lines());
         self.renderer.set_status_label(label);
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn on_paste(&mut self, text: &str) -> anyhow::Result<()> {
+    fn on_paste(&mut self, text: &str, out: &mut io::Stdout) -> anyhow::Result<()> {
         let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
             Mode::Prompt(prompt) => prompt,
             other => {
@@ -453,14 +473,14 @@ impl EventLoop {
             self.renderer
                 .set_prompt_status(prompt.status_label(), prompt.caret_cols());
             self.mode = Mode::Prompt(prompt);
-            self.renderer.draw(&mut io::stdout())?;
+            self.renderer.draw(out)?;
         } else {
             self.mode = Mode::Prompt(prompt);
         }
         Ok(())
     }
 
-    fn on_prompt_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    fn on_prompt_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<()> {
         let mut prompt = match mem::replace(&mut self.mode, Mode::Output) {
             Mode::Prompt(prompt) => prompt,
             other => {
@@ -473,11 +493,11 @@ impl EventLoop {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(&mut io::stdout())?;
+                self.renderer.draw(out)?;
             }
             PromptOutcome::Redraw => {
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
             PromptOutcome::Ignore => {
                 self.mode = Mode::Prompt(prompt);
@@ -485,7 +505,7 @@ impl EventLoop {
             PromptOutcome::Cancel => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
             PromptOutcome::Submit => {
                 let forward = prompt.forward();
@@ -504,21 +524,26 @@ impl EventLoop {
                     }
                 }
                 let outcome = submit_prompt(&mut self.renderer, &mut self.search, forward, query);
-                show_search_outcome(&mut self.renderer, &self.search, outcome)?;
+                show_search_outcome(&mut self.renderer, &self.search, outcome, out)?;
             }
         }
         Ok(())
     }
 
-    fn begin_mark(&mut self, op: MarkOp) -> anyhow::Result<KeyResult> {
+    fn begin_mark(&mut self, op: MarkOp, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Mark(op);
         self.renderer
             .set_status_label(Some(op.prompt_label().to_owned()));
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn on_mark_key(&mut self, key: KeyEvent, op: MarkOp) -> anyhow::Result<KeyResult> {
+    fn on_mark_key(
+        &mut self,
+        key: KeyEvent,
+        op: MarkOp,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
         let name = match key.code {
             KeyCode::Char(c)
@@ -530,7 +555,7 @@ impl EventLoop {
             _ => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
                 return Ok(KeyResult::Continue);
             }
         };
@@ -539,25 +564,25 @@ impl EventLoop {
                 self.marks.rows.insert(name, self.renderer.top_pos());
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
             MarkOp::Goto => {
                 let Some(pos) = self.marks.rows.get(&name).copied() else {
                     self.renderer.set_status_label(Some(NOT_SET.to_owned()));
-                    self.renderer.redraw(&mut io::stdout())?;
+                    self.renderer.redraw(out)?;
                     return Ok(KeyResult::Continue);
                 };
                 self.search.clear_match();
                 self.search.apply_highlight(&mut self.renderer);
                 self.renderer.set_status_label(None);
                 self.renderer.scroll_to_pos(pos);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
         }
         Ok(KeyResult::Continue)
     }
 
-    fn open_file_list(&mut self) -> anyhow::Result<KeyResult> {
+    fn open_file_list(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let n = self.output.files().len();
         self.file_list_index = match self.renderer.current_file_index() {
             Some(i) if i < n => i,
@@ -567,20 +592,20 @@ impl EventLoop {
         // Show the commit description (when present) from the top.
         // paint keeps the selected file on screen.
         self.help_renderer.scroll_top();
-        self.paint_file_list(true)?;
+        self.paint_file_list(true, out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn close_file_list(&mut self) -> anyhow::Result<KeyResult> {
+    fn close_file_list(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Continue)
     }
 
     /// Leave help for the view it was opened from. The stat page and
     /// help share `help_renderer`, so returning to the list must paint
     /// over the help text.
-    fn close_help(&mut self) -> anyhow::Result<()> {
+    fn close_help(&mut self, out: &mut io::Stdout) -> anyhow::Result<()> {
         let back = match self.mode {
             Mode::Help { back } => back,
             _ => HelpBack::Output,
@@ -588,25 +613,25 @@ impl EventLoop {
         match back {
             HelpBack::Files => {
                 self.mode = Mode::Files;
-                self.paint_file_list(true)?;
+                self.paint_file_list(true, out)?;
             }
             HelpBack::DiffSelect => {
                 self.mode = Mode::DiffSelect;
-                self.paint_diff_select(true)?;
+                self.paint_diff_select(true, out)?;
             }
             HelpBack::Smartlog => {
                 self.mode = Mode::Smartlog;
-                self.paint_smartlog(true)?;
+                self.paint_smartlog(true, out)?;
             }
             HelpBack::Output => {
                 self.mode = Mode::Output;
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
         }
         Ok(())
     }
 
-    fn open_selected_file(&mut self) -> anyhow::Result<KeyResult> {
+    fn open_selected_file(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let n_files = self.output.files().len();
         // Untracked rows have no diff to open; stay on the stat page.
         if self.file_list_index >= n_files {
@@ -622,14 +647,14 @@ impl EventLoop {
             self.renderer.set_status_label(None);
         }
         self.mode = Mode::Output;
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn draw_file_list(&mut self) -> anyhow::Result<()> {
+    fn draw_file_list(&mut self, out: &mut io::Stdout) -> anyhow::Result<()> {
         // Selection moved, or the list is already on screen: repaint
         // only if the frame actually changed.
-        self.paint_file_list(false)
+        self.paint_file_list(false, out)
     }
 
     /// Commit message for the stat page, only in `-c` / show-commit mode.
@@ -651,7 +676,7 @@ impl EventLoop {
     /// this list, and a non-forced draw would leave that other view up.
     /// A refresh of an unchanged list does not write anything, so the
     /// terminal text selection is kept.
-    fn paint_file_list(&mut self, force: bool) -> anyhow::Result<()> {
+    fn paint_file_list(&mut self, force: bool, out: &mut io::Stdout) -> anyhow::Result<()> {
         let files = self.output.files();
         let untracked = self.output.untracked();
         let n = files.len().saturating_add(untracked.len());
@@ -698,9 +723,9 @@ impl EventLoop {
         let row = file_list_description_rows(&description).saturating_add(self.file_list_index);
         self.help_renderer.ensure_line_visible(row);
         if force {
-            self.help_renderer.redraw(&mut io::stdout())?;
+            self.help_renderer.redraw(out)?;
         } else {
-            self.help_renderer.draw(&mut io::stdout())?;
+            self.help_renderer.draw(out)?;
         }
         Ok(())
     }
@@ -722,24 +747,24 @@ impl EventLoop {
         }
     }
 
-    fn move_file_selection(&mut self, target: usize) -> anyhow::Result<()> {
+    fn move_file_selection(&mut self, target: usize, out: &mut io::Stdout) -> anyhow::Result<()> {
         let n = self.output.stat_row_count();
         if n == 0 {
             self.file_list_index = 0;
         } else {
             self.file_list_index = target.min(n - 1);
         }
-        self.draw_file_list()
+        self.draw_file_list(out)
     }
 
-    fn on_files_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_files_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         if key.kind != KeyEventKind::Press {
             return Ok(KeyResult::Continue);
         }
         // Enter opens the file. key_action maps Enter to ScrollDown, so
         // handle it before that table.
         if key.code == KeyCode::Enter {
-            return self.open_selected_file();
+            return self.open_selected_file(out);
         }
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
@@ -748,8 +773,8 @@ impl EventLoop {
         let page = list_page_size(self.size);
         match action {
             KeyAction::Quit => Ok(KeyResult::Quit),
-            KeyAction::FileList => self.open_selected_file(),
-            KeyAction::DismissMessage => self.close_file_list(),
+            KeyAction::FileList => self.open_selected_file(out),
+            KeyAction::DismissMessage => self.close_file_list(out),
             KeyAction::Help => {
                 // Leave the list and show help. Closing help returns here.
                 self.mode = Mode::Help {
@@ -759,64 +784,64 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::ContextLess | KeyAction::ContextMore => {
                 // Apply on the diff underneath; stay in the list. The
                 // next snapshot redraws the list.
-                let result = self.change_context(action)?;
+                let result = self.change_context(action, out)?;
                 self.mode = Mode::Files;
                 // change_context redrew the diff. Paint the list back
                 // over it; the cached list frame would otherwise match
                 // and a non-forced draw would leave the diff up.
-                self.paint_file_list(true)?;
+                self.paint_file_list(true, out)?;
                 Ok(result)
             }
             KeyAction::ScrollDown => {
                 let next = self.file_list_index.saturating_add(1);
-                self.move_file_selection(next)?;
+                self.move_file_selection(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollUp => {
                 let prev = self.file_list_index.saturating_sub(1);
-                self.move_file_selection(prev)?;
+                self.move_file_selection(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollTop => {
-                self.move_file_selection(0)?;
+                self.move_file_selection(0, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollBottom => {
-                self.move_file_selection(n.saturating_sub(1))?;
+                self.move_file_selection(n.saturating_sub(1), out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageDown => {
                 let next = self.file_list_index.saturating_add(page);
-                self.move_file_selection(next)?;
+                self.move_file_selection(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageUp => {
                 let prev = self.file_list_index.saturating_sub(page);
-                self.move_file_selection(prev)?;
+                self.move_file_selection(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
-            KeyAction::Smartlog => self.open_smartlog(),
+            KeyAction::Smartlog => self.open_smartlog(out),
             KeyAction::Dash
             | KeyAction::DiffMode
             | KeyAction::SearchForward
@@ -833,11 +858,11 @@ impl EventLoop {
         self.renderer.set_status_mode(Some(text));
     }
 
-    fn open_diff_select(&mut self) -> anyhow::Result<KeyResult> {
+    fn open_diff_select(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         if self.tool.is_none() {
             self.renderer
                 .set_status_label(Some(String::from("not an sl or git repository")));
-            self.renderer.redraw(&mut io::stdout())?;
+            self.renderer.redraw(out)?;
             return Ok(KeyResult::Continue);
         }
         let current = self.spec.lock().unwrap().view_kind();
@@ -850,17 +875,17 @@ impl EventLoop {
         };
         self.mode = Mode::DiffSelect;
         self.help_renderer.scroll_top();
-        self.paint_diff_select(true)?;
+        self.paint_diff_select(true, out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn close_diff_select(&mut self) -> anyhow::Result<KeyResult> {
+    fn close_diff_select(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Continue)
     }
 
-    fn paint_diff_select(&mut self, force: bool) -> anyhow::Result<()> {
+    fn paint_diff_select(&mut self, force: bool, out: &mut io::Stdout) -> anyhow::Result<()> {
         let current = self.spec.lock().unwrap().view_kind();
         let lines = diff_mode_lines(
             self.diff_mode_index,
@@ -886,25 +911,29 @@ impl EventLoop {
         self.help_renderer.set_status_mode(None);
         self.help_renderer.ensure_line_visible(self.diff_mode_index);
         if force {
-            self.help_renderer.redraw(&mut io::stdout())?;
+            self.help_renderer.redraw(out)?;
         } else {
-            self.help_renderer.draw(&mut io::stdout())?;
+            self.help_renderer.draw(out)?;
         }
         Ok(())
     }
 
-    fn move_diff_mode_selection(&mut self, target: usize) -> anyhow::Result<()> {
+    fn move_diff_mode_selection(
+        &mut self,
+        target: usize,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<()> {
         let last = DIFF_VIEW_KINDS.len().saturating_sub(1);
         self.diff_mode_index = target.min(last);
-        self.paint_diff_select(false)
+        self.paint_diff_select(false, out)
     }
 
-    fn apply_diff_mode_selection(&mut self) -> anyhow::Result<KeyResult> {
+    fn apply_diff_mode_selection(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let Some(tool) = self.tool else {
-            return self.close_diff_select();
+            return self.close_diff_select(out);
         };
         let Some(kind) = DIFF_VIEW_KINDS.get(self.diff_mode_index).copied() else {
-            return self.close_diff_select();
+            return self.close_diff_select(out);
         };
         {
             let mut spec = self.spec.lock().unwrap();
@@ -922,16 +951,20 @@ impl EventLoop {
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Refresh)
     }
 
-    fn on_diff_select_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_diff_select_key(
+        &mut self,
+        key: KeyEvent,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<KeyResult> {
         if key.kind != KeyEventKind::Press {
             return Ok(KeyResult::Continue);
         }
         if key.code == KeyCode::Enter {
-            return self.apply_diff_mode_selection();
+            return self.apply_diff_mode_selection(out);
         }
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
@@ -940,7 +973,7 @@ impl EventLoop {
         let page = list_page_size(self.size);
         match action {
             KeyAction::Quit => Ok(KeyResult::Quit),
-            KeyAction::DiffMode | KeyAction::DismissMessage => self.close_diff_select(),
+            KeyAction::DiffMode | KeyAction::DismissMessage => self.close_diff_select(out),
             KeyAction::Help => {
                 self.mode = Mode::Help {
                     back: HelpBack::DiffSelect,
@@ -949,56 +982,56 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
             KeyAction::ContextLess | KeyAction::ContextMore => {
-                let result = self.change_context(action)?;
+                let result = self.change_context(action, out)?;
                 self.mode = Mode::DiffSelect;
-                self.paint_diff_select(true)?;
+                self.paint_diff_select(true, out)?;
                 Ok(result)
             }
             KeyAction::ScrollDown => {
                 let next = self.diff_mode_index.saturating_add(1);
-                self.move_diff_mode_selection(next)?;
+                self.move_diff_mode_selection(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollUp => {
                 let prev = self.diff_mode_index.saturating_sub(1);
-                self.move_diff_mode_selection(prev)?;
+                self.move_diff_mode_selection(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollTop => {
-                self.move_diff_mode_selection(0)?;
+                self.move_diff_mode_selection(0, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollBottom => {
-                self.move_diff_mode_selection(n.saturating_sub(1))?;
+                self.move_diff_mode_selection(n.saturating_sub(1), out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageDown => {
                 let next = self.diff_mode_index.saturating_add(page);
-                self.move_diff_mode_selection(next)?;
+                self.move_diff_mode_selection(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageUp => {
                 let prev = self.diff_mode_index.saturating_sub(page);
-                self.move_diff_mode_selection(prev)?;
+                self.move_diff_mode_selection(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
@@ -1048,6 +1081,69 @@ impl EventLoop {
         SmartlogSelection::at(view, i)
     }
 
+    fn request_pr_statuses(&mut self) {
+        self.enqueue_pr_statuses(false);
+    }
+
+    fn request_pr_statuses_now(&mut self) {
+        self.enqueue_pr_statuses(true);
+    }
+
+    /// `bypass_cooldown` skips the [`PR_STATUS_REFRESH`] reuse window
+    /// so open and `r` always hit the forge.
+    fn enqueue_pr_statuses(&mut self, bypass_cooldown: bool) {
+        let Some(view) = &self.smartlog else {
+            return;
+        };
+        let Some(forge) = view.forge.clone() else {
+            return;
+        };
+        if self.pr_status_forge.as_ref() != Some(&forge) {
+            self.pr_statuses.clear();
+            self.pr_status_forge = Some(forge.clone());
+        }
+        let mut numbers = Vec::new();
+        for commit in &view.commits {
+            if let Some(number) = commit.github_pr {
+                if !numbers.contains(&number) {
+                    numbers.push(number);
+                }
+            }
+        }
+        if numbers.is_empty() {
+            return;
+        }
+        let _ = self.pr_status_tx.send(PrStatusJob {
+            forge,
+            numbers,
+            bypass_cooldown,
+        });
+    }
+
+    fn on_pr_statuses(&mut self, batch: PrStatusBatch, out: &mut io::Stdout) -> anyhow::Result<()> {
+        // A fetch started for the previous remote can finish after
+        // the tree's forge changed. Its PR numbers are not this map.
+        if self.pr_status_forge.as_ref() != Some(&batch.forge) {
+            return Ok(());
+        }
+        for (number, status) in batch.statuses {
+            self.pr_statuses.insert(number, status);
+        }
+        if matches!(self.mode, Mode::Smartlog) {
+            let keep_offset = match (&self.smartlog, self.smartlog_sel.as_ref()) {
+                (Some(old), Some(sel)) => sel.resolve(old).map(|index| {
+                    (
+                        commit_header_row(old, index),
+                        self.help_renderer.top_line_index(),
+                    )
+                }),
+                _ => None,
+            };
+            self.paint_smartlog_scroll(false, keep_offset, out)?;
+        }
+        Ok(())
+    }
+
     fn enable_smartlog_poll(&self) {
         let was = self.smartlog_live.swap(true, Ordering::SeqCst);
         if !was {
@@ -1062,7 +1158,11 @@ impl EventLoop {
         }
     }
 
-    fn on_smartlog_poll(&mut self, msg: SmartlogPollMsg) -> anyhow::Result<()> {
+    fn on_smartlog_poll(
+        &mut self,
+        msg: SmartlogPollMsg,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<()> {
         if msg.epoch != self.smartlog_epoch.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -1092,13 +1192,14 @@ impl EventLoop {
         };
         self.smartlog_sel = next_sel;
         self.smartlog = Some(msg.view);
+        self.request_pr_statuses();
         if matches!(self.mode, Mode::Smartlog) {
-            self.paint_smartlog_scroll(false, keep_offset)?;
+            self.paint_smartlog_scroll(false, keep_offset, out)?;
         }
         Ok(())
     }
 
-    fn open_smartlog(&mut self) -> anyhow::Result<KeyResult> {
+    fn open_smartlog(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let from_files = match self.mode {
             Mode::Files => true,
             Mode::Smartlog => self.smartlog_from_files,
@@ -1108,10 +1209,10 @@ impl EventLoop {
             let msg = String::from("smartlog requires sl");
             if from_files {
                 self.help_renderer.set_status_label(Some(msg));
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
             } else {
                 self.renderer.set_status_label(Some(msg));
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
             }
             return Ok(KeyResult::Continue);
         }
@@ -1124,7 +1225,8 @@ impl EventLoop {
                 // Drop any poll that started before this snapshot.
                 self.smartlog_epoch.fetch_add(1, Ordering::SeqCst);
                 self.enable_smartlog_poll();
-                self.paint_smartlog(true)?;
+                self.request_pr_statuses_now();
+                self.paint_smartlog(true, out)?;
                 // Put the selected commit's header at the top.
                 if let Some(view) = &self.smartlog {
                     if let Some(index) =
@@ -1132,7 +1234,7 @@ impl EventLoop {
                     {
                         let row = commit_header_row(view, index);
                         self.help_renderer.scroll_to_line(row);
-                        self.help_renderer.redraw(&mut io::stdout())?;
+                        self.help_renderer.redraw(out)?;
                     }
                 }
                 Ok(KeyResult::Continue)
@@ -1141,31 +1243,31 @@ impl EventLoop {
                 let msg = format!("smartlog: {err}");
                 if from_files {
                     self.help_renderer.set_status_label(Some(msg));
-                    self.help_renderer.redraw(&mut io::stdout())?;
+                    self.help_renderer.redraw(out)?;
                 } else {
                     self.renderer.set_status_label(Some(msg));
-                    self.renderer.redraw(&mut io::stdout())?;
+                    self.renderer.redraw(out)?;
                 }
                 Ok(KeyResult::Continue)
             }
         }
     }
 
-    fn close_smartlog(&mut self) -> anyhow::Result<KeyResult> {
+    fn close_smartlog(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.disable_smartlog_poll();
         if self.smartlog_from_files {
             self.smartlog_from_files = false;
             self.mode = Mode::Files;
-            self.paint_file_list(true)?;
+            self.paint_file_list(true, out)?;
         } else {
             self.mode = Mode::Output;
-            self.renderer.redraw(&mut io::stdout())?;
+            self.renderer.redraw(out)?;
         }
         Ok(KeyResult::Continue)
     }
 
-    fn paint_smartlog(&mut self, force: bool) -> anyhow::Result<()> {
-        self.paint_smartlog_scroll(force, None)
+    fn paint_smartlog(&mut self, force: bool, out: &mut io::Stdout) -> anyhow::Result<()> {
+        self.paint_smartlog_scroll(force, None, out)
     }
 
     /// `keep_offset` is `(selected header row, viewport top line)` from
@@ -1176,6 +1278,7 @@ impl EventLoop {
         &mut self,
         force: bool,
         keep_offset: Option<(usize, usize)>,
+        out: &mut io::Stdout,
     ) -> anyhow::Result<()> {
         let Some(view) = &self.smartlog else {
             return Ok(());
@@ -1183,6 +1286,7 @@ impl EventLoop {
         let lines = render_lines(
             view,
             self.smartlog_sel.as_ref(),
+            &self.pr_statuses,
             TimestampsSecs::now(),
             self.help_renderer.terminal_bg(),
             self.size.width,
@@ -1216,25 +1320,25 @@ impl EventLoop {
             }
         }
         if force {
-            self.help_renderer.redraw(&mut io::stdout())?;
+            self.help_renderer.redraw(out)?;
         } else {
-            self.help_renderer.draw(&mut io::stdout())?;
+            self.help_renderer.draw(out)?;
         }
         Ok(())
     }
 
-    fn move_smartlog_sel(&mut self, target: usize) -> anyhow::Result<()> {
+    fn move_smartlog_sel(&mut self, target: usize, out: &mut io::Stdout) -> anyhow::Result<()> {
         let Some(view) = &self.smartlog else {
             return Ok(());
         };
         if view.commits.is_empty() {
             self.smartlog_sel = None;
-            return self.paint_smartlog(false);
+            return self.paint_smartlog(false, out);
         }
         let last = view.commits.len().saturating_sub(1);
         let index = target.min(last);
         self.smartlog_sel = SmartlogSelection::at(view, index);
-        self.paint_smartlog(false)
+        self.paint_smartlog(false, out)
     }
 
     fn resolved_smartlog_index(&self) -> Option<usize> {
@@ -1243,15 +1347,19 @@ impl EventLoop {
         sel.resolve(view)
     }
 
-    fn apply_smartlog_selection(&mut self, open: SmartlogOpen) -> anyhow::Result<KeyResult> {
+    fn apply_smartlog_selection(
+        &mut self,
+        open: SmartlogOpen,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<KeyResult> {
         let Some(view) = &self.smartlog else {
-            return self.close_smartlog();
+            return self.close_smartlog(out);
         };
         let Some(index) = self.resolved_smartlog_index() else {
-            return self.close_smartlog();
+            return self.close_smartlog(out);
         };
         let Some(commit) = view.commits.get(index) else {
-            return self.close_smartlog();
+            return self.close_smartlog(out);
         };
         // Top `@` is spelled `.`; every other row uses the full digest.
         let rev = if index == 0 && commit.current {
@@ -1261,7 +1369,7 @@ impl EventLoop {
         };
         let is_current = commit.current;
         let Some(tool) = self.tool else {
-            return self.close_smartlog();
+            return self.close_smartlog(out);
         };
         let spec = match open {
             SmartlogOpen::Enter => {
@@ -1298,25 +1406,29 @@ impl EventLoop {
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         Ok(KeyResult::Refresh)
     }
 
-    fn on_smartlog_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_smartlog_key(
+        &mut self,
+        key: KeyEvent,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<KeyResult> {
         if key.kind != KeyEventKind::Press {
             return Ok(KeyResult::Continue);
         }
         if key.code == KeyCode::Enter {
-            return self.apply_smartlog_selection(SmartlogOpen::Enter);
+            return self.apply_smartlog_selection(SmartlogOpen::Enter, out);
         }
         // `c` / `v` open -c / -r for the selected commit. `r` stays refresh.
         if !key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    return self.apply_smartlog_selection(SmartlogOpen::Change);
+                    return self.apply_smartlog_selection(SmartlogOpen::Change, out);
                 }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
-                    return self.apply_smartlog_selection(SmartlogOpen::Rev);
+                    return self.apply_smartlog_selection(SmartlogOpen::Rev, out);
                 }
                 _ => {}
             }
@@ -1331,7 +1443,7 @@ impl EventLoop {
         let page = list_page_size(self.size);
         match action {
             KeyAction::Quit => Ok(KeyResult::Quit),
-            KeyAction::Smartlog | KeyAction::DismissMessage => self.close_smartlog(),
+            KeyAction::Smartlog | KeyAction::DismissMessage => self.close_smartlog(out),
             KeyAction::Help => {
                 self.mode = Mode::Help {
                     back: HelpBack::Smartlog,
@@ -1340,17 +1452,17 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => {
                 // Re-query the tree.
-                self.open_smartlog()
+                self.open_smartlog(out)
             }
             KeyAction::ContextLess | KeyAction::ContextMore => {
-                let result = self.change_context(action)?;
+                let result = self.change_context(action, out)?;
                 self.mode = Mode::Smartlog;
-                self.paint_smartlog(true)?;
+                self.paint_smartlog(true, out)?;
                 Ok(result)
             }
             KeyAction::ScrollDown => {
@@ -1358,7 +1470,7 @@ impl EventLoop {
                     Some(i) => i.saturating_add(1),
                     None => 0,
                 };
-                self.move_smartlog_sel(next)?;
+                self.move_smartlog_sel(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollUp => {
@@ -1366,15 +1478,15 @@ impl EventLoop {
                     Some(i) => i.saturating_sub(1),
                     None => 0,
                 };
-                self.move_smartlog_sel(prev)?;
+                self.move_smartlog_sel(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollTop => {
-                self.move_smartlog_sel(0)?;
+                self.move_smartlog_sel(0, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollBottom => {
-                self.move_smartlog_sel(n.saturating_sub(1))?;
+                self.move_smartlog_sel(n.saturating_sub(1), out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageDown => {
@@ -1382,7 +1494,7 @@ impl EventLoop {
                     Some(i) => i.saturating_add(page),
                     None => 0,
                 };
-                self.move_smartlog_sel(next)?;
+                self.move_smartlog_sel(next, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollPageUp => {
@@ -1390,21 +1502,21 @@ impl EventLoop {
                     Some(i) => i.saturating_sub(page),
                     None => 0,
                 };
-                self.move_smartlog_sel(prev)?;
+                self.move_smartlog_sel(prev, out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(&mut io::stdout())?;
+                self.help_renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
@@ -1419,14 +1531,18 @@ impl EventLoop {
         }
     }
 
-    fn change_context(&mut self, action: KeyAction) -> anyhow::Result<KeyResult> {
+    fn change_context(
+        &mut self,
+        action: KeyAction,
+        out: &mut io::Stdout,
+    ) -> anyhow::Result<KeyResult> {
         let increase = matches!(action, KeyAction::ContextMore);
         let current = self.context.load(Ordering::SeqCst);
         let next = step_context(current, increase);
         self.context.store(next, Ordering::SeqCst);
         self.renderer
             .set_status_label(Some(format!("context {next}")));
-        self.renderer.redraw(&mut io::stdout())?;
+        self.renderer.redraw(out)?;
         if next == current {
             Ok(KeyResult::Continue)
         } else {
@@ -1434,13 +1550,13 @@ impl EventLoop {
         }
     }
 
-    fn on_help_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_help_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
         };
         match action {
             KeyAction::Quit | KeyAction::Help => {
-                self.close_help()?;
+                self.close_help(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -1463,26 +1579,26 @@ impl EventLoop {
                     HelpBack::Files => {
                         // Same as u/U on the stat page: change context and
                         // stay on the list.
-                        let result = self.change_context(action)?;
+                        let result = self.change_context(action, out)?;
                         self.mode = Mode::Files;
-                        self.paint_file_list(true)?;
+                        self.paint_file_list(true, out)?;
                         Ok(result)
                     }
                     HelpBack::DiffSelect => {
-                        let result = self.change_context(action)?;
+                        let result = self.change_context(action, out)?;
                         self.mode = Mode::DiffSelect;
-                        self.paint_diff_select(true)?;
+                        self.paint_diff_select(true, out)?;
                         Ok(result)
                     }
                     HelpBack::Smartlog => {
-                        let result = self.change_context(action)?;
+                        let result = self.change_context(action, out)?;
                         self.mode = Mode::Smartlog;
-                        self.paint_smartlog(true)?;
+                        self.paint_smartlog(true, out)?;
                         Ok(result)
                     }
                     HelpBack::Output => {
                         self.mode = Mode::Output;
-                        self.change_context(action)
+                        self.change_context(action, out)
                     }
                 }
             }
@@ -1505,13 +1621,13 @@ impl EventLoop {
             | KeyAction::ScrollBottom
             | KeyAction::ScrollPageDown
             | KeyAction::ScrollPageUp) => {
-                apply_view_action(&mut self.help_renderer, action)?;
+                apply_view_action(&mut self.help_renderer, action, out)?;
                 Ok(KeyResult::Continue)
             }
         }
     }
 
-    fn on_output_key(&mut self, key: KeyEvent) -> anyhow::Result<KeyResult> {
+    fn on_output_key(&mut self, key: KeyEvent, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         let Some(action) = key_action(&key) else {
             return Ok(KeyResult::Continue);
         };
@@ -1519,7 +1635,7 @@ impl EventLoop {
             KeyAction::Dash => {
                 self.mode = Mode::Dash;
                 self.renderer.set_status_label(Some("-".to_owned()));
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -1531,7 +1647,7 @@ impl EventLoop {
                 }
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(&mut io::stdout())?;
+                self.renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Quit => Ok(KeyResult::Quit),
@@ -1542,30 +1658,30 @@ impl EventLoop {
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(&mut io::stdout())?;
+                self.help_renderer.redraw(out)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
-            KeyAction::ContextLess | KeyAction::ContextMore => self.change_context(action),
-            KeyAction::FileList => self.open_file_list(),
-            KeyAction::DiffMode => self.open_diff_select(),
-            KeyAction::Smartlog => self.open_smartlog(),
+            KeyAction::ContextLess | KeyAction::ContextMore => self.change_context(action, out),
+            KeyAction::FileList => self.open_file_list(out),
+            KeyAction::DiffMode => self.open_diff_select(out),
+            KeyAction::Smartlog => self.open_smartlog(out),
             KeyAction::SearchForward | KeyAction::SearchBackward => {
                 let forward = matches!(action, KeyAction::SearchForward);
                 let prompt = Prompt::new(forward);
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(&mut io::stdout())?;
+                self.renderer.draw(out)?;
                 Ok(KeyResult::Continue)
             }
-            KeyAction::SetMark => self.begin_mark(MarkOp::Set),
-            KeyAction::GotoMark => self.begin_mark(MarkOp::Goto),
+            KeyAction::SetMark => self.begin_mark(MarkOp::Set, out),
+            KeyAction::GotoMark => self.begin_mark(MarkOp::Goto, out),
             KeyAction::SearchNext | KeyAction::SearchPrev => {
                 let reverse = matches!(action, KeyAction::SearchPrev);
                 self.resume_search_pattern();
                 let outcome = search_next(&mut self.renderer, &mut self.search, reverse);
-                show_search_outcome(&mut self.renderer, &self.search, outcome)?;
+                show_search_outcome(&mut self.renderer, &self.search, outcome, out)?;
                 Ok(KeyResult::Continue)
             }
             action @ (KeyAction::ScrollDown
@@ -1584,7 +1700,7 @@ impl EventLoop {
                     self.search.apply_highlight(&mut self.renderer);
                     self.renderer.set_status_label(None);
                 }
-                apply_view_action(&mut self.renderer, action)?;
+                apply_view_action(&mut self.renderer, action, out)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -1595,6 +1711,7 @@ fn show_search_outcome(
     renderer: &mut Renderer,
     search: &Search,
     outcome: SearchOutcome,
+    out: &mut io::Stdout,
 ) -> anyhow::Result<()> {
     match outcome {
         SearchOutcome::Found => {
@@ -1618,62 +1735,14 @@ fn show_search_outcome(
             renderer.set_status_label(Some(INVALID_PATTERN.to_owned()));
         }
     }
-    renderer.redraw(&mut io::stdout())?;
+    renderer.redraw(out)?;
     Ok(())
-}
-
-/// One smartlog snapshot from the background poll, tagged with the
-/// epoch observed when the fetch started.
-struct SmartlogPollMsg {
-    epoch: u64,
-    view: SmartlogView,
 }
 
 async fn recv_smartlog_poll(rx: &mut Option<Receiver<SmartlogPollMsg>>) -> Option<SmartlogPollMsg> {
     match rx.as_mut() {
         Some(rx) => rx.recv().await,
         None => future::pending().await,
-    }
-}
-
-/// Re-query `sl smartlog` on `interval` while `live` is set.
-async fn smartlog_poll_loop(
-    live: Arc<AtomicBool>,
-    epoch: Arc<AtomicU64>,
-    wake: NotifyRx,
-    interval: Duration,
-    tx: mpsc::Sender<SmartlogPollMsg>,
-) {
-    loop {
-        if !live.load(Ordering::SeqCst) {
-            wake.notified().await;
-            continue;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = wake.notified() => {
-                continue;
-            }
-        }
-        if !live.load(Ordering::SeqCst) {
-            continue;
-        }
-        let seen = epoch.load(Ordering::SeqCst);
-        let view = match tokio::task::spawn_blocking(fetch_smartlog).await {
-            Ok(Ok(view)) => view,
-            Ok(Err(_)) => continue,
-            Err(_) => continue,
-        };
-        if !live.load(Ordering::SeqCst) {
-            continue;
-        }
-        if epoch.load(Ordering::SeqCst) != seen {
-            continue;
-        }
-        let msg = SmartlogPollMsg { epoch: seen, view };
-        if tx.send(msg).await.is_err() {
-            return;
-        }
     }
 }
 
@@ -1748,34 +1817,38 @@ fn stat_list_labels(output: &DiffOutput) -> Vec<String> {
     labels
 }
 
-fn apply_view_action(view: &mut Renderer, action: KeyAction) -> anyhow::Result<()> {
+fn apply_view_action(
+    view: &mut Renderer,
+    action: KeyAction,
+    out: &mut io::Stdout,
+) -> anyhow::Result<()> {
     match action {
         KeyAction::ScrollDown | KeyAction::ScrollViewDown => {
             view.scroll_down();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::ScrollUp | KeyAction::ScrollViewUp => {
             view.scroll_up();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::Redraw => {
-            view.redraw(&mut io::stdout())?;
+            view.redraw(out)?;
         }
         KeyAction::ScrollTop => {
             view.scroll_top();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::ScrollBottom => {
             view.scroll_bottom();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::ScrollPageDown => {
             view.scroll_page_down();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::ScrollPageUp => {
             view.scroll_page_up();
-            view.draw(&mut io::stdout())?;
+            view.draw(out)?;
         }
         KeyAction::Quit
         | KeyAction::Help

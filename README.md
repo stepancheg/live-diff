@@ -14,9 +14,11 @@ Sapling is used when the repository already has sl metadata (`.sl` or
 
 ## Features
 
-- Smartlog (`t`), drawn from `sl smartlog` and refreshed while open, with GitHub or Origin PR links
+- Smartlog (`t`), drawn from `sl smartlog` and refreshed while open,
+  with GitHub or Origin PR links and review/CI status
 - Live working-copy diff that keeps the scroll position
-- Commit view (`-c`, or Enter in the smartlog) and diff against the previous commit
+- Commit view (`-c`, or Enter in the smartlog) and diff against the
+  previous commit
 - Git and Sapling
 - Origin and GitHub pull request diffs
 - Pinned file header

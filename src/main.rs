@@ -37,10 +37,12 @@ use crate::interval_arg::IntervalArg;
 use crate::render::terminal_size;
 use crate::repo::pr_diff::github_pr_diff_command;
 use crate::repo::pr_diff::origin_pr_diff_command;
+use crate::repo::pr_status_actor::PrStatusActor;
 use crate::repo::repo::DEFAULT_CONTEXT;
 use crate::repo::repo::DiffTool;
 use crate::repo::repo::MAX_CONTEXT;
 use crate::repo::repo::diff_tool;
+use crate::repo::sl::smartlog_actor::SmartlogActor;
 use crate::search::history::store::History;
 use crate::terminal::guard::TerminalGuard;
 use crate::terminal::guard::restore_terminal;
@@ -184,6 +186,10 @@ async fn main() -> anyhow::Result<()> {
     let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
     let (_key_reader, keys) = spawn_key_reader(stop);
 
+    // Spawn the tree actors first and hand their channel ends to the
+    // UI loop. The handles stay in this scope until `run` returns.
+    let smartlog_actor = SmartlogActor::spawn(menu_tool, args.interval.as_duration());
+    let pr_status_actor = PrStatusActor::spawn();
     EventLoop::new(
         terminal_bg,
         history,
@@ -192,6 +198,10 @@ async fn main() -> anyhow::Result<()> {
         spec,
         menu_tool,
         start_view,
+        smartlog_actor.live,
+        smartlog_actor.epoch,
+        smartlog_actor.wake_tx,
+        pr_status_actor.job_tx,
     )
     .run(
         first_lines,
@@ -199,7 +209,8 @@ async fn main() -> anyhow::Result<()> {
         keys,
         refresh_tx,
         capture_task,
-        args.interval.as_duration(),
+        smartlog_actor.views_rx,
+        pr_status_actor.result_rx,
     )
     .await
 }
