@@ -27,8 +27,9 @@ use crate::diff::commit_description_lines;
 use crate::diff::file_list_description_rows;
 use crate::diff::file_list_lines;
 use crate::help::help_lines;
-use crate::render::Renderer;
-use crate::render::ScrollAnchor;
+use crate::render::frame::FrameRenderer;
+use crate::render::renderer::Renderer;
+use crate::render::renderer::ScrollAnchor;
 use crate::repo::forge::Forge;
 use crate::repo::pr_status::PR_STATUS_REFRESH;
 use crate::repo::pr_status::PrStatus;
@@ -129,6 +130,8 @@ pub(crate) enum StartView {
 pub(crate) struct EventLoop {
     renderer: Renderer,
     help_renderer: Renderer,
+    /// Terminal frame presenter shared by both renderers.
+    frames: FrameRenderer,
     search: Search,
     history: History,
     marks: Marks,
@@ -187,6 +190,7 @@ impl EventLoop {
         EventLoop {
             renderer: Renderer::new(terminal_bg, size),
             help_renderer: Renderer::new(terminal_bg, size),
+            frames: FrameRenderer::new(),
             search: Search::new(),
             history,
             marks: Marks::default(),
@@ -324,10 +328,10 @@ impl EventLoop {
         self.help_renderer.update_size(self.size);
         match self.mode {
             Mode::Help { .. } | Mode::Files | Mode::DiffSelect | Mode::Smartlog => {
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
             }
             _ => {
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
         }
         Ok(())
@@ -378,7 +382,7 @@ impl EventLoop {
             _ => {
                 // The start view replaces this frame; do not flash the diff.
                 if self.start_view == StartView::Diff {
-                    self.renderer.draw(out)?;
+                    self.renderer.draw(out, &mut self.frames)?;
                 }
             }
         }
@@ -451,13 +455,13 @@ impl EventLoop {
                 .case_mode()
                 .status(self.search.match_label(self.renderer.lines()).as_deref());
             self.renderer.set_status_label(Some(status));
-            self.renderer.redraw(out)?;
+            self.renderer.redraw(out, &mut self.frames)?;
             return Ok(KeyResult::Continue);
         }
         // Unknown option or cancel: drop the `-` prompt.
         let label = self.search.match_label(self.renderer.lines());
         self.renderer.set_status_label(label);
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Continue)
     }
 
@@ -473,7 +477,7 @@ impl EventLoop {
             self.renderer
                 .set_prompt_status(prompt.status_label(), prompt.caret_cols());
             self.mode = Mode::Prompt(prompt);
-            self.renderer.draw(out)?;
+            self.renderer.draw(out, &mut self.frames)?;
         } else {
             self.mode = Mode::Prompt(prompt);
         }
@@ -493,11 +497,11 @@ impl EventLoop {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(out)?;
+                self.renderer.draw(out, &mut self.frames)?;
             }
             PromptOutcome::Redraw => {
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
             PromptOutcome::Ignore => {
                 self.mode = Mode::Prompt(prompt);
@@ -505,7 +509,7 @@ impl EventLoop {
             PromptOutcome::Cancel => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
             PromptOutcome::Submit => {
                 let forward = prompt.forward();
@@ -524,7 +528,13 @@ impl EventLoop {
                     }
                 }
                 let outcome = submit_prompt(&mut self.renderer, &mut self.search, forward, query);
-                show_search_outcome(&mut self.renderer, &self.search, outcome, out)?;
+                show_search_outcome(
+                    &mut self.renderer,
+                    &self.search,
+                    outcome,
+                    out,
+                    &mut self.frames,
+                )?;
             }
         }
         Ok(())
@@ -534,7 +544,7 @@ impl EventLoop {
         self.mode = Mode::Mark(op);
         self.renderer
             .set_status_label(Some(op.prompt_label().to_owned()));
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Continue)
     }
 
@@ -555,7 +565,7 @@ impl EventLoop {
             _ => {
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
                 return Ok(KeyResult::Continue);
             }
         };
@@ -564,19 +574,19 @@ impl EventLoop {
                 self.marks.rows.insert(name, self.renderer.top_pos());
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
             MarkOp::Goto => {
                 let Some(pos) = self.marks.rows.get(&name).copied() else {
                     self.renderer.set_status_label(Some(NOT_SET.to_owned()));
-                    self.renderer.redraw(out)?;
+                    self.renderer.redraw(out, &mut self.frames)?;
                     return Ok(KeyResult::Continue);
                 };
                 self.search.clear_match();
                 self.search.apply_highlight(&mut self.renderer);
                 self.renderer.set_status_label(None);
                 self.renderer.scroll_to_pos(pos);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
         }
         Ok(KeyResult::Continue)
@@ -598,7 +608,7 @@ impl EventLoop {
 
     fn close_file_list(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Continue)
     }
 
@@ -625,7 +635,7 @@ impl EventLoop {
             }
             HelpBack::Output => {
                 self.mode = Mode::Output;
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
         }
         Ok(())
@@ -647,7 +657,7 @@ impl EventLoop {
             self.renderer.set_status_label(None);
         }
         self.mode = Mode::Output;
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Continue)
     }
 
@@ -723,9 +733,9 @@ impl EventLoop {
         let row = file_list_description_rows(&description).saturating_add(self.file_list_index);
         self.help_renderer.ensure_line_visible(row);
         if force {
-            self.help_renderer.redraw(out)?;
+            self.help_renderer.redraw(out, &mut self.frames)?;
         } else {
-            self.help_renderer.draw(out)?;
+            self.help_renderer.draw(out, &mut self.frames)?;
         }
         Ok(())
     }
@@ -784,7 +794,7 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
@@ -828,17 +838,17 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Smartlog => self.open_smartlog(out),
@@ -862,7 +872,7 @@ impl EventLoop {
         if self.tool.is_none() {
             self.renderer
                 .set_status_label(Some(String::from("not an sl or git repository")));
-            self.renderer.redraw(out)?;
+            self.renderer.redraw(out, &mut self.frames)?;
             return Ok(KeyResult::Continue);
         }
         let current = self.spec.lock().unwrap().view_kind();
@@ -881,7 +891,7 @@ impl EventLoop {
 
     fn close_diff_select(&mut self, out: &mut io::Stdout) -> anyhow::Result<KeyResult> {
         self.mode = Mode::Output;
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Continue)
     }
 
@@ -911,9 +921,9 @@ impl EventLoop {
         self.help_renderer.set_status_mode(None);
         self.help_renderer.ensure_line_visible(self.diff_mode_index);
         if force {
-            self.help_renderer.redraw(out)?;
+            self.help_renderer.redraw(out, &mut self.frames)?;
         } else {
-            self.help_renderer.draw(out)?;
+            self.help_renderer.draw(out, &mut self.frames)?;
         }
         Ok(())
     }
@@ -951,7 +961,7 @@ impl EventLoop {
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Refresh)
     }
 
@@ -982,7 +992,7 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
@@ -1021,17 +1031,17 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
@@ -1209,10 +1219,10 @@ impl EventLoop {
             let msg = String::from("smartlog requires sl");
             if from_files {
                 self.help_renderer.set_status_label(Some(msg));
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
             } else {
                 self.renderer.set_status_label(Some(msg));
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
             }
             return Ok(KeyResult::Continue);
         }
@@ -1234,7 +1244,7 @@ impl EventLoop {
                     {
                         let row = commit_header_row(view, index);
                         self.help_renderer.scroll_to_line(row);
-                        self.help_renderer.redraw(out)?;
+                        self.help_renderer.redraw(out, &mut self.frames)?;
                     }
                 }
                 Ok(KeyResult::Continue)
@@ -1243,10 +1253,10 @@ impl EventLoop {
                 let msg = format!("smartlog: {err}");
                 if from_files {
                     self.help_renderer.set_status_label(Some(msg));
-                    self.help_renderer.redraw(out)?;
+                    self.help_renderer.redraw(out, &mut self.frames)?;
                 } else {
                     self.renderer.set_status_label(Some(msg));
-                    self.renderer.redraw(out)?;
+                    self.renderer.redraw(out, &mut self.frames)?;
                 }
                 Ok(KeyResult::Continue)
             }
@@ -1261,7 +1271,7 @@ impl EventLoop {
             self.paint_file_list(true, out)?;
         } else {
             self.mode = Mode::Output;
-            self.renderer.redraw(out)?;
+            self.renderer.redraw(out, &mut self.frames)?;
         }
         Ok(KeyResult::Continue)
     }
@@ -1320,9 +1330,9 @@ impl EventLoop {
             }
         }
         if force {
-            self.help_renderer.redraw(out)?;
+            self.help_renderer.redraw(out, &mut self.frames)?;
         } else {
-            self.help_renderer.draw(out)?;
+            self.help_renderer.draw(out, &mut self.frames)?;
         }
         Ok(())
     }
@@ -1406,7 +1416,7 @@ impl EventLoop {
         self.search.apply_highlight(&mut self.renderer);
         self.renderer.scroll_top();
         self.renderer.set_status_label(None);
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         Ok(KeyResult::Refresh)
     }
 
@@ -1452,7 +1462,7 @@ impl EventLoop {
                 self.help_renderer.set_status_label(None);
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => {
@@ -1506,17 +1516,17 @@ impl EventLoop {
                 Ok(KeyResult::Continue)
             }
             KeyAction::Redraw => {
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewDown => {
                 self.help_renderer.scroll_down();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::ScrollViewUp => {
                 self.help_renderer.scroll_up();
-                self.help_renderer.draw(out)?;
+                self.help_renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::FileList
@@ -1542,7 +1552,7 @@ impl EventLoop {
         self.context.store(next, Ordering::SeqCst);
         self.renderer
             .set_status_label(Some(format!("context {next}")));
-        self.renderer.redraw(out)?;
+        self.renderer.redraw(out, &mut self.frames)?;
         if next == current {
             Ok(KeyResult::Continue)
         } else {
@@ -1621,7 +1631,7 @@ impl EventLoop {
             | KeyAction::ScrollBottom
             | KeyAction::ScrollPageDown
             | KeyAction::ScrollPageUp) => {
-                apply_view_action(&mut self.help_renderer, action, out)?;
+                apply_view_action(&mut self.help_renderer, action, out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -1635,7 +1645,7 @@ impl EventLoop {
             KeyAction::Dash => {
                 self.mode = Mode::Dash;
                 self.renderer.set_status_label(Some("-".to_owned()));
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::DismissMessage => {
@@ -1647,7 +1657,7 @@ impl EventLoop {
                 }
                 let label = self.search.match_label(self.renderer.lines());
                 self.renderer.set_status_label(label);
-                self.renderer.redraw(out)?;
+                self.renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Quit => Ok(KeyResult::Quit),
@@ -1658,7 +1668,7 @@ impl EventLoop {
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
-                self.help_renderer.redraw(out)?;
+                self.help_renderer.redraw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::Refresh => Ok(KeyResult::Refresh),
@@ -1672,7 +1682,7 @@ impl EventLoop {
                 self.renderer
                     .set_prompt_status(prompt.status_label(), prompt.caret_cols());
                 self.mode = Mode::Prompt(prompt);
-                self.renderer.draw(out)?;
+                self.renderer.draw(out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
             KeyAction::SetMark => self.begin_mark(MarkOp::Set, out),
@@ -1681,7 +1691,13 @@ impl EventLoop {
                 let reverse = matches!(action, KeyAction::SearchPrev);
                 self.resume_search_pattern();
                 let outcome = search_next(&mut self.renderer, &mut self.search, reverse);
-                show_search_outcome(&mut self.renderer, &self.search, outcome, out)?;
+                show_search_outcome(
+                    &mut self.renderer,
+                    &self.search,
+                    outcome,
+                    out,
+                    &mut self.frames,
+                )?;
                 Ok(KeyResult::Continue)
             }
             action @ (KeyAction::ScrollDown
@@ -1700,7 +1716,7 @@ impl EventLoop {
                     self.search.apply_highlight(&mut self.renderer);
                     self.renderer.set_status_label(None);
                 }
-                apply_view_action(&mut self.renderer, action, out)?;
+                apply_view_action(&mut self.renderer, action, out, &mut self.frames)?;
                 Ok(KeyResult::Continue)
             }
         }
@@ -1712,6 +1728,7 @@ fn show_search_outcome(
     search: &Search,
     outcome: SearchOutcome,
     out: &mut io::Stdout,
+    frames: &mut FrameRenderer,
 ) -> anyhow::Result<()> {
     match outcome {
         SearchOutcome::Found => {
@@ -1735,7 +1752,7 @@ fn show_search_outcome(
             renderer.set_status_label(Some(INVALID_PATTERN.to_owned()));
         }
     }
-    renderer.redraw(out)?;
+    renderer.redraw(out, frames)?;
     Ok(())
 }
 
@@ -1821,34 +1838,35 @@ fn apply_view_action(
     view: &mut Renderer,
     action: KeyAction,
     out: &mut io::Stdout,
+    frames: &mut FrameRenderer,
 ) -> anyhow::Result<()> {
     match action {
         KeyAction::ScrollDown | KeyAction::ScrollViewDown => {
             view.scroll_down();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::ScrollUp | KeyAction::ScrollViewUp => {
             view.scroll_up();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::Redraw => {
-            view.redraw(out)?;
+            view.redraw(out, frames)?;
         }
         KeyAction::ScrollTop => {
             view.scroll_top();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::ScrollBottom => {
             view.scroll_bottom();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::ScrollPageDown => {
             view.scroll_page_down();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::ScrollPageUp => {
             view.scroll_page_up();
-            view.draw(out)?;
+            view.draw(out, frames)?;
         }
         KeyAction::Quit
         | KeyAction::Help

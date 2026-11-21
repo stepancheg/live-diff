@@ -34,7 +34,7 @@ use crate::capture::capture_command_output_loop;
 use crate::event_loop::EventLoop;
 use crate::event_loop::StartView;
 use crate::interval_arg::IntervalArg;
-use crate::render::terminal_size;
+use crate::render::renderer::terminal_size;
 use crate::repo::pr_diff::github_pr_diff_command;
 use crate::repo::pr_diff::origin_pr_diff_command;
 use crate::repo::pr_status_actor::PrStatusActor;

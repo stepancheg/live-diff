@@ -6,8 +6,6 @@ use crossterm::cursor::Hide;
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::Show;
 use crossterm::queue;
-use crossterm::terminal::Clear;
-use crossterm::terminal::ClearType;
 use unicode_width::UnicodeWidthChar;
 
 use crate::diff::DiffOutput;
@@ -15,6 +13,8 @@ use crate::diff::FileHeaderSpan;
 use crate::diff::FileKey;
 use crate::diff::file_header_index;
 use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
+use crate::render::frame::Frame;
+use crate::render::frame::FrameRenderer;
 use crate::terminal::height::Height;
 use crate::terminal::line::Line;
 use crate::terminal::line::compile_search;
@@ -40,7 +40,6 @@ pub(crate) struct Renderer {
     /// Top of the viewport in original-line coordinates.
     pos: LinePos,
     lines: LinesWithWrappedRowCount,
-    drawn: Option<DrawnFrame>,
     terminal_bg: TerminalBg,
     /// Left side of the status bar while a prompt or message is showing.
     /// The right side is the viewport ruler (`Top` / `Bot` / `NN%`).
@@ -103,23 +102,11 @@ struct Highlight {
     current: Option<(usize, usize)>,
 }
 
-struct DrawnFrame {
-    size: Size,
-    rows: Vec<String>,
-    status: String,
-    caret: u32,
-    cursor: bool,
-    pos: LinePos,
-    content_gen: u64,
-    ruler: String,
-}
-
 impl Renderer {
     pub(crate) fn new(terminal_bg: TerminalBg, size: Size) -> Renderer {
         Renderer {
             pos: LinePos::default(),
             lines: LinesWithWrappedRowCount::new(Vec::new(), size.width),
-            drawn: None,
             terminal_bg,
             status_label: None,
             status_caret: None,
@@ -588,24 +575,27 @@ impl Renderer {
         line_at_visual_row(self.lines.row_counts(), last)
     }
 
-    pub(crate) fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
-        self.draw_frame(out, false)
+    pub(crate) fn draw(
+        &mut self,
+        out: &mut impl Write,
+        frames: &mut FrameRenderer,
+    ) -> io::Result<()> {
+        let frame = self.compose_frame();
+        frames.render(out, frame)
     }
 
-    pub(crate) fn redraw(&mut self, out: &mut impl Write) -> io::Result<()> {
-        self.draw_frame(out, true)
+    pub(crate) fn redraw(
+        &mut self,
+        out: &mut impl Write,
+        frames: &mut FrameRenderer,
+    ) -> io::Result<()> {
+        // A full frame goes through the same presenter. It skips the
+        // write when that frame is already on screen.
+        self.draw(out, frames)
     }
 
-    fn draw_frame(&mut self, out: &mut impl Write, force: bool) -> io::Result<()> {
+    fn compose_frame(&self) -> Frame {
         let size = self.size;
-        if !force && self.body_cache_valid() {
-            let ruler = match &self.drawn {
-                Some(drawn) => drawn.ruler.clone(),
-                None => String::new(),
-            };
-            return self.paint_status(out, &ruler);
-        }
-        let terminal_width = size.width;
         let total = self.lines.total();
         let layout = self.view_layout();
         let start = cmp::min(layout.content_start.as_usize(), total);
@@ -625,10 +615,12 @@ impl Renderer {
         } else {
             size.width.0.saturating_sub(right_cols).saturating_sub(1)
         };
-        let visible = self.visible_rows(&layout);
-        let keys: Vec<String> = visible.iter().map(row_fingerprint).collect();
+        let rows = self.visible_rows(&layout);
+        let mut body = Vec::new();
+        // `Vec` as `Write` does not return an error.
+        let _ = write_one_line(&rows, size.width, &mut body);
         // Cursor only for an editable prompt (`/?`), which sets a caret.
-        let show_cursor = self.status_caret.is_some();
+        let cursor = self.status_caret.is_some();
         let (label, caret) = match &self.status_label {
             Some(label) => {
                 let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
@@ -637,92 +629,12 @@ impl Renderer {
             None => (String::new(), 0),
         };
         let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &right);
-        let unchanged = match &self.drawn {
-            Some(drawn) => {
-                !force
-                    && drawn.size == size
-                    && drawn.rows == keys
-                    && drawn.status == status
-                    && drawn.caret == caret
-                    && drawn.cursor == show_cursor
-            }
-            None => false,
-        };
-        if unchanged {
-            return Ok(());
-        }
-        let mut stream = Vec::new();
-        queue!(&mut stream, MoveTo(0, 0), Clear(ClearType::All))?;
-        write_one_line(&visible, terminal_width, &mut stream)?;
-        write_status_bar(&mut stream, size, &status)?;
-        stream.extend_from_slice(b"\x1b[0m");
-        write_cursor(&mut stream, size, caret, show_cursor)?;
-        out.write_all(&stream)?;
-        out.flush()?;
-        self.drawn = Some(DrawnFrame {
-            size,
-            rows: keys,
-            status,
-            caret,
-            cursor: show_cursor,
-            pos: self.pos,
-            content_gen: self.content_gen,
-            ruler,
-        });
-        Ok(())
-    }
-
-    fn body_cache_valid(&self) -> bool {
-        match &self.drawn {
-            Some(drawn) => {
-                drawn.size == self.size
-                    && drawn.pos == self.pos
-                    && drawn.content_gen == self.content_gen
-            }
-            None => false,
-        }
-    }
-
-    /// Repaint only the status row and cursor. Body rows stay as they are.
-    fn paint_status(&mut self, out: &mut impl Write, ruler: &str) -> io::Result<()> {
-        let size = self.size;
-        let right = self.status_right(ruler);
-        let right_cols = cmp::min(display_width(&right).0, size.width.0);
-        let label_cols = if right_cols == 0 {
-            size.width.0
-        } else {
-            size.width.0.saturating_sub(right_cols).saturating_sub(1)
-        };
-        let show_cursor = self.status_caret.is_some();
-        let (label, caret) = match &self.status_label {
-            Some(label) => {
-                let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
-                fit_label_to_caret(label, Width(label_cols), caret)
-            }
-            None => (String::new(), 0),
-        };
-        let status = status_bar_fingerprint(self.terminal_bg, size.width, &label, &right);
-        let unchanged = match &self.drawn {
-            Some(drawn) => {
-                drawn.status == status && drawn.caret == caret && drawn.cursor == show_cursor
-            }
-            None => false,
-        };
-        if unchanged {
-            return Ok(());
-        }
-        let mut stream = Vec::new();
-        write_status_bar(&mut stream, size, &status)?;
-        stream.extend_from_slice(b"\x1b[0m");
-        write_cursor(&mut stream, size, caret, show_cursor)?;
-        out.write_all(&stream)?;
-        out.flush()?;
-        if let Some(drawn) = self.drawn.as_mut() {
-            drawn.status = status;
-            drawn.caret = caret;
-            drawn.cursor = show_cursor;
-        }
-        Ok(())
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&body);
+        let _ = write_status_bar(&mut bytes, size, &status);
+        bytes.extend_from_slice(b"\x1b[0m");
+        let _ = write_cursor(&mut bytes, size, caret, cursor);
+        Frame { bytes }
     }
 
     fn viewport_top_row(&self) -> WrappedRow {
@@ -1100,35 +1012,6 @@ struct ViewLayout {
     pin_header: Option<FileHeaderSpan>,
 }
 
-struct VisualRow {
-    pieces: Vec<Piece>,
-    width: Width,
-    /// True when this row continues the same logical line after a width wrap.
-    soft_wrap: bool,
-    /// Erase to the end of this screen row with the current background.
-    fill_eol: bool,
-}
-
-struct Piece {
-    sgr: String,
-    text: String,
-    link: Option<String>,
-}
-
-fn row_fingerprint(row: &VisualRow) -> String {
-    let mut s = String::new();
-    for piece in &row.pieces {
-        s.push_str(&piece.sgr);
-        if let Some(link) = &piece.link {
-            s.push('\u{1}');
-            s.push_str(link);
-            s.push('\u{1}');
-        }
-        s.push_str(&piece.text);
-    }
-    s
-}
-
 /// `mode` and `note` sit just left of `ruler` when they fit in `width`.
 /// Parts are separated by spaces. If the full cluster is too wide, the
 /// note is omitted first, then the mode.
@@ -1237,29 +1120,6 @@ fn viewport_ruler(top: usize, end: usize, total: usize) -> String {
     let pct = (end as u64 * 100 / total as u64) as u32;
     let pct = cmp::min(cmp::max(pct, 1), 99);
     format!("{pct:>2}%")
-}
-
-fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
-    if size.height.0 == 0 || size.width == 0 {
-        return Ok(());
-    }
-    if !show_cursor {
-        queue!(out, Hide)?;
-        return Ok(());
-    }
-    let Ok(row) = u16::try_from(size.height.0 - 1) else {
-        return Ok(());
-    };
-    let col = if caret < size.width.0 {
-        caret
-    } else {
-        size.width.0.saturating_sub(1)
-    };
-    let Ok(col) = u16::try_from(col) else {
-        return Ok(());
-    };
-    queue!(out, MoveTo(col, row), Show)?;
-    Ok(())
 }
 
 fn display_width(s: &str) -> Width {
@@ -1428,78 +1288,6 @@ fn byte_offset_at_wrap_row(line: &Line, terminal_width: Width, target: WrappedRo
     }
     byte_off
 }
-
-fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Result<()> {
-    if size.height.0 == 0 || size.width == 0 || status.is_empty() {
-        return Ok(());
-    }
-    let Ok(row) = u16::try_from(size.height.0 - 1) else {
-        return Ok(());
-    };
-    queue!(out, MoveTo(0, row))?;
-    out.write_all(status.as_bytes())?;
-    Ok(())
-}
-
-fn write_one_line(
-    rows: &[VisualRow],
-    terminal_width: Width,
-    out: &mut impl Write,
-) -> io::Result<()> {
-    let mut last_sgr: Option<String> = None;
-    let mut open_link: Option<String> = None;
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            let prev = &rows[i - 1];
-            let soft = row.soft_wrap && prev.width == terminal_width;
-            if !soft {
-                out.write_all(b"\r\n")?;
-            }
-        }
-        for piece in &row.pieces {
-            if open_link != piece.link {
-                if open_link.is_some() {
-                    out.write_all(OSC8_CLOSE)?;
-                }
-                if let Some(link) = &piece.link {
-                    out.write_all(b"\x1b]8;;")?;
-                    out.write_all(link.as_bytes())?;
-                    out.write_all(b"\x1b\\")?;
-                }
-                open_link = piece.link.clone();
-            }
-            if last_sgr.as_deref() != Some(piece.sgr.as_str()) {
-                out.write_all(piece.sgr.as_bytes())?;
-                last_sgr = Some(piece.sgr.clone());
-            }
-            out.write_all(piece.text.as_bytes())?;
-        }
-        // Skip EL on a full-width row that soft-wraps: the terminal
-        // cursor may sit on the right margin, and the next row's text
-        // continues without a newline.
-        let next_soft = match rows.get(i + 1) {
-            Some(next) => next.soft_wrap && row.width == terminal_width,
-            None => false,
-        };
-        if row.fill_eol {
-            if !next_soft {
-                // Close the link so EL cannot extend an OSC 8 run.
-                if open_link.is_some() {
-                    out.write_all(OSC8_CLOSE)?;
-                    open_link = None;
-                }
-                out.write_all(b"\x1b[K")?;
-            }
-        }
-    }
-    if open_link.is_some() {
-        out.write_all(OSC8_CLOSE)?;
-    }
-    Ok(())
-}
-
-/// OSC 8 hyperlink closer.
-const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
 
 /// Build the wrapped rows in the half-open range `start..end`.
 ///
@@ -1680,18 +1468,145 @@ pub(crate) fn terminal_size() -> io::Result<Size> {
     })
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct VisualRow {
+    pieces: Vec<Piece>,
+    width: Width,
+    /// True when this row continues the same logical line after a width wrap.
+    soft_wrap: bool,
+    /// Erase to the end of this screen row with the current background.
+    fill_eol: bool,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct Piece {
+    sgr: String,
+    text: String,
+    link: Option<String>,
+}
+
+#[cfg_attr(not(test), expect(dead_code))]
+fn row_fingerprint(row: &VisualRow) -> String {
+    let mut s = String::new();
+    for piece in &row.pieces {
+        s.push_str(&piece.sgr);
+        if let Some(link) = &piece.link {
+            s.push('\u{1}');
+            s.push_str(link);
+            s.push('\u{1}');
+        }
+        s.push_str(&piece.text);
+    }
+    s
+}
+
+fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
+    if size.height.0 == 0 || size.width == 0 {
+        return Ok(());
+    }
+    if !show_cursor {
+        queue!(out, Hide)?;
+        return Ok(());
+    }
+    let Ok(row) = u16::try_from(size.height.0 - 1) else {
+        return Ok(());
+    };
+    let col = if caret < size.width.0 {
+        caret
+    } else {
+        size.width.0.saturating_sub(1)
+    };
+    let Ok(col) = u16::try_from(col) else {
+        return Ok(());
+    };
+    queue!(out, MoveTo(col, row), Show)?;
+    Ok(())
+}
+
+fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Result<()> {
+    if size.height.0 == 0 || size.width == 0 || status.is_empty() {
+        return Ok(());
+    }
+    let Ok(row) = u16::try_from(size.height.0 - 1) else {
+        return Ok(());
+    };
+    queue!(out, MoveTo(0, row))?;
+    out.write_all(status.as_bytes())?;
+    Ok(())
+}
+
+/// OSC 8 hyperlink closer.
+const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
+
+fn write_one_line(
+    rows: &[VisualRow],
+    terminal_width: Width,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut last_sgr: Option<String> = None;
+    let mut open_link: Option<String> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            let prev = &rows[i - 1];
+            let soft = row.soft_wrap && prev.width == terminal_width;
+            if !soft {
+                out.write_all(b"\r\n")?;
+            }
+        }
+        for piece in &row.pieces {
+            if open_link != piece.link {
+                if open_link.is_some() {
+                    out.write_all(OSC8_CLOSE)?;
+                }
+                if let Some(link) = &piece.link {
+                    out.write_all(b"\x1b]8;;")?;
+                    out.write_all(link.as_bytes())?;
+                    out.write_all(b"\x1b\\")?;
+                }
+                open_link = piece.link.clone();
+            }
+            if last_sgr.as_deref() != Some(piece.sgr.as_str()) {
+                out.write_all(piece.sgr.as_bytes())?;
+                last_sgr = Some(piece.sgr.clone());
+            }
+            out.write_all(piece.text.as_bytes())?;
+        }
+        // Skip EL on a full-width row that soft-wraps: the terminal
+        // cursor may sit on the right margin, and the next row's text
+        // continues without a newline.
+        let next_soft = match rows.get(i + 1) {
+            Some(next) => next.soft_wrap && row.width == terminal_width,
+            None => false,
+        };
+        if row.fill_eol {
+            if !next_soft {
+                // Close the link so EL cannot extend an OSC 8 run.
+                if open_link.is_some() {
+                    out.write_all(OSC8_CLOSE)?;
+                    open_link = None;
+                }
+                out.write_all(b"\x1b[K")?;
+            }
+        }
+    }
+    if open_link.is_some() {
+        out.write_all(OSC8_CLOSE)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp;
     use std::num::NonZeroU16;
 
+    use super::line_visual_rows;
+    use super::row_fingerprint;
+    use super::viewport_ruler;
+    use super::visual_rows_in_range;
     use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
     use crate::lines_with_wrapped_row_count::line_visual_row_count;
-    use crate::render::Renderer;
-    use crate::render::line_visual_rows;
-    use crate::render::row_fingerprint;
-    use crate::render::viewport_ruler;
-    use crate::render::visual_rows_in_range;
+    use crate::render::renderer::Renderer;
     use crate::terminal::color::TerminalColor;
     use crate::terminal::height::Height;
     use crate::terminal::parse::parse_command_output;
@@ -1728,12 +1643,13 @@ mod tests {
     fn draw_screen(input: &[u8], width: u16, height: u16, scroll_downs: u32) -> vt100::Parser {
         let size = size(u32::from(width), u32::from(height));
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(input));
         for _ in 0..scroll_downs {
             renderer.scroll_down();
         }
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(height, width);
         parser.process(&buf);
         parser
@@ -1823,9 +1739,10 @@ mod tests {
     #[test]
     fn test_wrapped_line_is_emitted_as_one_line() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 5));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"0123456789abcdefghij"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert_eq!(true, text.contains("0123456789abcdefghij"));
         let content_at = text.find("0123456789abcdefghij").unwrap();
@@ -1909,10 +1826,11 @@ mod tests {
     #[test]
     fn test_scroll_top_and_bottom() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
         renderer.scroll_bottom();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
@@ -1920,7 +1838,7 @@ mod tests {
         assert_eq!("       Bot", row_text(&parser, 2, 10));
         renderer.scroll_top();
         buf.clear();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
@@ -1936,12 +1854,13 @@ mod tests {
     #[test]
     fn test_scroll_position_follows_text_across_width_change() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(5, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         // Width 5 wraps "0123456789abcdefghij" into 01234/56789/abcde/fghij.
         renderer.set_lines(parse_command_output(b"0123456789abcdefghij\nWXYZ\n"));
         renderer.scroll_down();
         renderer.scroll_down();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 5);
         parser.process(&buf);
         assert_eq!("abcde", row_text(&parser, 0, 5));
@@ -1950,7 +1869,7 @@ mod tests {
         // show "ghij" instead.
         buf.clear();
         renderer.update_size(size(8, 3));
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 8);
         parser.process(&buf);
         assert_eq!("89abcdef", row_text(&parser, 0, 8));
@@ -1959,10 +1878,11 @@ mod tests {
     #[test]
     fn test_scroll_page_down_and_up() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\nd\ne\nf\n"));
         renderer.scroll_page_down();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("c", row_text(&parser, 0, 10));
@@ -1970,7 +1890,7 @@ mod tests {
         assert_eq!("       66%", row_text(&parser, 2, 10));
         renderer.scroll_page_up();
         buf.clear();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("a", row_text(&parser, 0, 10));
@@ -2015,47 +1935,51 @@ mod tests {
     #[test]
     fn test_draw_skips_when_visible_unchanged() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 2));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
         buf.clear();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(true, buf.is_empty());
     }
 
     #[test]
     fn test_draw_skips_when_change_is_below_visible_area() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         buf.clear();
         renderer.set_lines(parse_command_output(b"a\nb\nX\n"));
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(true, buf.is_empty());
     }
 
     #[test]
     fn test_draw_writes_when_visible_area_changes() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         buf.clear();
         renderer.set_lines(parse_command_output(b"a\nB\nc\n"));
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 
     #[test]
     fn test_redraw_writes_when_visible_unchanged() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 2));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         buf.clear();
-        renderer.redraw(&mut buf).unwrap();
+        renderer.redraw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 
@@ -2076,16 +2000,17 @@ diff --git a/foo b/foo
         let width = crate::terminal::width::Width(40);
         let lines = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width, &[]);
         let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 10));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(lines);
         renderer.set_status_label(Some(String::from("Enter: go to file")));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
         buf.clear();
         let again = crate::diff::file_list_lines(&files, &[], 0, TerminalBg::Dark, width, &[]);
         renderer.set_lines(again);
         renderer.set_status_label(Some(String::from("Enter: go to file")));
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(true, buf.is_empty());
     }
 
@@ -2093,10 +2018,11 @@ diff --git a/foo b/foo
     fn test_search_highlight_sets_bg() {
         let size = size(20, 3);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"xxFOOyy\na\x1b[31mFOO\x1b[0mb\n"));
         renderer.set_highlight(Some("FOO".to_owned()), Some((0, 2)), false);
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 20);
         parser.process(&buf);
         assert_eq!("xxFOOyy", row_text(&parser, 0, 20));
@@ -2154,10 +2080,11 @@ diff --git a/foo b/foo
     #[test]
     fn test_status_bar_shows_untracked_note() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(28, 2));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\n"));
         renderer.set_status_note(Some(String::from("3 untracked")));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(2, 28);
         parser.process(&buf);
         // Right-aligned: note, space, ruler. "3 untracked Bot" is 15 cols.
@@ -2165,7 +2092,7 @@ diff --git a/foo b/foo
         // A left-hand label stays on the left; the note stays by the ruler.
         renderer.set_status_label(Some(String::from("context 3")));
         buf.clear();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(2, 28);
         parser.process(&buf);
         assert_eq!("context 3    3 untracked Bot", row_text(&parser, 1, 28));
@@ -2174,11 +2101,12 @@ diff --git a/foo b/foo
     #[test]
     fn test_status_bar_shows_diff_mode() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 2));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\n"));
         renderer.set_status_mode(Some(String::from("diff -c .")));
         renderer.set_status_note(Some(String::from("3 untracked")));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(2, 40);
         parser.process(&buf);
         // mode, note, ruler, right-aligned.
@@ -2190,7 +2118,7 @@ diff --git a/foo b/foo
         // "diff -c . Bot" is 13 cols; "diff -c . 3 untracked Bot" is 25.
         renderer.update_size(size(16, 2));
         buf.clear();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(2, 16);
         parser.process(&buf);
         assert_eq!("  diff -c .  Bot", row_text(&parser, 1, 16));
@@ -2199,9 +2127,10 @@ diff --git a/foo b/foo
     #[test]
     fn test_status_bar_light_grey_on_light_bg() {
         let mut renderer = Renderer::new(TerminalBg::Light, size(10, 2));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(2, 10);
         parser.process(&buf);
         assert_eq!("       Bot", row_text(&parser, 1, 10));
@@ -2215,13 +2144,14 @@ diff --git a/foo b/foo
     fn test_status_update_does_not_repaint_body() {
         let size = size(10, 3);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(true, buf.windows(4).any(|w| w == b"\x1b[2J"));
         buf.clear();
         renderer.set_prompt_status("/hi".to_owned(), 3);
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
         assert_eq!(false, buf.windows(4).any(|w| w == b"\x1b[2J"));
         assert_eq!(true, buf.windows(3).any(|w| w == b"/hi"));
@@ -2230,12 +2160,13 @@ diff --git a/foo b/foo
     #[test]
     fn test_draw_writes_when_end_indicator_appears() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\n"));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         buf.clear();
         renderer.set_lines(parse_command_output(b"a\nb\n"));
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         assert_eq!(false, buf.is_empty());
     }
 
@@ -2251,12 +2182,13 @@ diff --git a/foo b/foo
     fn draw_diff(input: &[u8], width: u16, height: u16, scroll_downs: u32) -> vt100::Parser {
         let size = size(u32::from(width), u32::from(height));
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_diff(crate::diff::parse_diff(input));
         for _ in 0..scroll_downs {
             renderer.scroll_down();
         }
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(height, width);
         parser.process(&buf);
         parser
@@ -2476,10 +2408,11 @@ diff --git a/foo b/foo
         let mut input = context_file_diff("foo", 20);
         input.push_str(&context_file_diff("bar", 20));
         let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_diff(crate::diff::parse_diff(input.as_bytes()));
         renderer.scroll_bottom();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(8, 40);
         parser.process(&buf);
         assert_eq!("bar", row_text(&parser, 0, 40));
@@ -2499,10 +2432,11 @@ diff --git a/foo b/foo
         }
         text.push_str(" last\n");
         let mut renderer = Renderer::new(TerminalBg::Dark, size(40, 8));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_diff(crate::diff::parse_diff(text.as_bytes()));
         renderer.scroll_bottom();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(8, 40);
         parser.process(&buf);
         assert_eq!("foo", row_text(&parser, 0, 40));
@@ -2523,10 +2457,11 @@ diff --git a/foo b/foo
     #[test]
     fn test_non_diff_scroll_bottom_unchanged() {
         let mut renderer = Renderer::new(TerminalBg::Dark, size(10, 3));
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\nd\ne\nf\n"));
         renderer.scroll_bottom();
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         assert_eq!("e", row_text(&parser, 0, 10));

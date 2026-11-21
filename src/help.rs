@@ -58,7 +58,7 @@ mod tests {
     use std::num::NonZeroU16;
 
     use crate::help::help_lines;
-    use crate::render::Renderer;
+    use crate::render::renderer::Renderer;
     use crate::terminal::height::Height;
     use crate::terminal::size::Size;
     use crate::terminal::width::Width;
@@ -136,9 +136,10 @@ mod tests {
             height: Height(45),
         };
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(help_lines());
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(45, 80);
         parser.process(&buf);
         assert_eq!(true, parser.screen().contents().contains("Show this help"));

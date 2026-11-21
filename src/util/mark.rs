@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::render::LinePos;
+use crate::render::renderer::LinePos;
 
 pub(crate) const NOT_SET: &str = "Mark not set";
 

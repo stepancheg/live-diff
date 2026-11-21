@@ -252,7 +252,7 @@ mod tests {
     use crossterm::event::KeyEventState;
     use crossterm::event::KeyModifiers;
 
-    use crate::render::Renderer;
+    use crate::render::renderer::Renderer;
     use crate::search::prompt::Prompt;
     use crate::search::prompt::PromptOutcome;
     use crate::terminal::height::Height;
@@ -289,10 +289,11 @@ mod tests {
     fn test_status_bar_shows_prompt() {
         let size = size(10, 3);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"a\nb\nc\nd\n"));
         renderer.set_status_label(Some("/foo".to_owned()));
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(3, 10);
         parser.process(&buf);
         let mut text = String::new();

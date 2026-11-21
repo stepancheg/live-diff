@@ -1,4 +1,4 @@
-use crate::render::Renderer;
+use crate::render::renderer::Renderer;
 use crate::search::state::CaseMode;
 use crate::search::state::Search;
 use crate::terminal::line::Line;
@@ -206,7 +206,7 @@ fn line_contains(line: &Line, pattern: &str) -> bool {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::render::Renderer;
+    use crate::render::renderer::Renderer;
     use crate::search::find::SearchOutcome;
     use crate::search::find::find_backward;
     use crate::search::find::find_forward;
@@ -437,6 +437,7 @@ mod tests {
     fn test_occurrence_index_on_same_line() {
         let size = size(20, 6);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"foo foo\nbar\nfoo\nx\nx\nx\nx\nx\n"));
         let mut search = Search::new();
         assert_eq!(
@@ -468,7 +469,7 @@ mod tests {
         assert_eq!(0, renderer.top_line_index());
 
         let mut buf = Vec::new();
-        renderer.draw(&mut buf).unwrap();
+        renderer.draw(&mut buf, &mut prev).unwrap();
         let mut parser = vt_parser(6, 20);
         parser.process(&buf);
         // Current match is the "foo" on logical line 2, still on screen.

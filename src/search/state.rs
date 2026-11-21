@@ -1,6 +1,6 @@
 use std::cmp;
 
-use crate::render::Renderer;
+use crate::render::renderer::Renderer;
 use crate::search::find::occurrences;
 use crate::terminal::line::Line;
 use crate::terminal::line::fold_case;
@@ -248,7 +248,7 @@ impl Search {
 mod tests {
     use std::num::NonZeroU16;
 
-    use crate::render::Renderer;
+    use crate::render::renderer::Renderer;
     use crate::search::find::SearchOutcome;
     use crate::search::find::search_next;
     use crate::search::find::submit_prompt;
@@ -311,6 +311,7 @@ mod tests {
     fn test_toggle_ignore_case_refreshes_hits() {
         let size = size(10, 6);
         let mut renderer = Renderer::new(TerminalBg::Dark, size);
+        let mut prev = crate::render::frame::FrameRenderer::new();
         renderer.set_lines(parse_command_output(b"FOO\nfoo\nFoo\nbar\n"));
         let mut search = Search::new();
         assert_eq!(
@@ -336,7 +337,7 @@ mod tests {
                 .status(search.match_label(renderer.lines()).as_deref())
         );
         let mut buf = Vec::new();
-        renderer.redraw(&mut buf).unwrap();
+        renderer.redraw(&mut buf, &mut prev).unwrap();
         let mut parser =
             vt100::Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(10).unwrap(), 0);
         parser.process(&buf);
