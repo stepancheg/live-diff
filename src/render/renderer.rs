@@ -2,10 +2,8 @@ use std::cmp;
 use std::io;
 use std::io::Write;
 
-use crossterm::cursor::Hide;
+use crossterm::Command;
 use crossterm::cursor::MoveTo;
-use crossterm::cursor::Show;
-use crossterm::queue;
 use unicode_width::UnicodeWidthChar;
 
 use crate::diff::DiffOutput;
@@ -13,6 +11,7 @@ use crate::diff::FileHeaderSpan;
 use crate::diff::FileKey;
 use crate::diff::file_header_index;
 use crate::lines_with_wrapped_row_count::LinesWithWrappedRowCount;
+use crate::render::cursor::FrameCursor;
 use crate::render::frame::Frame;
 use crate::render::frame::FrameRenderer;
 use crate::terminal::height::Height;
@@ -620,7 +619,7 @@ impl Renderer {
         // `Vec` as `Write` does not return an error.
         let _ = write_one_line(&rows, size.width, &mut body);
         // Cursor only for an editable prompt (`/?`), which sets a caret.
-        let cursor = self.status_caret.is_some();
+        let show_cursor = self.status_caret.is_some();
         let (label, caret) = match &self.status_label {
             Some(label) => {
                 let caret = self.status_caret.unwrap_or_else(|| display_width(label).0);
@@ -633,8 +632,8 @@ impl Renderer {
         bytes.extend_from_slice(&body);
         let _ = write_status_bar(&mut bytes, size, &status);
         bytes.extend_from_slice(b"\x1b[0m");
-        let _ = write_cursor(&mut bytes, size, caret, cursor);
-        Frame { bytes }
+        let cursor = frame_cursor_at(size, caret, show_cursor);
+        Frame { bytes, cursor }
     }
 
     fn viewport_top_row(&self) -> WrappedRow {
@@ -1500,16 +1499,25 @@ fn row_fingerprint(row: &VisualRow) -> String {
     s
 }
 
-fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool) -> io::Result<()> {
-    if size.height.0 == 0 || size.width == 0 {
-        return Ok(());
-    }
+/// Append a crossterm command's ANSI form to the frame buffer.
+/// `queue!` executes against a terminal; `write_ansi` only encodes.
+fn write_command(out: &mut impl Write, command: impl Command) -> io::Result<()> {
+    let mut ansi = String::new();
+    command
+        .write_ansi(&mut ansi)
+        .map_err(|_| io::Error::other("command ansi"))?;
+    out.write_all(ansi.as_bytes())
+}
+
+fn frame_cursor_at(size: Size, caret: u32, show_cursor: bool) -> FrameCursor {
     if !show_cursor {
-        queue!(out, Hide)?;
-        return Ok(());
+        return FrameCursor::Hidden;
+    }
+    if size.height.0 == 0 || size.width == 0 {
+        return FrameCursor::Hidden;
     }
     let Ok(row) = u16::try_from(size.height.0 - 1) else {
-        return Ok(());
+        return FrameCursor::Hidden;
     };
     let col = if caret < size.width.0 {
         caret
@@ -1517,10 +1525,9 @@ fn write_cursor(out: &mut impl Write, size: Size, caret: u32, show_cursor: bool)
         size.width.0.saturating_sub(1)
     };
     let Ok(col) = u16::try_from(col) else {
-        return Ok(());
+        return FrameCursor::Hidden;
     };
-    queue!(out, MoveTo(col, row), Show)?;
-    Ok(())
+    FrameCursor::At { col, row }
 }
 
 fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Result<()> {
@@ -1530,7 +1537,7 @@ fn write_status_bar(out: &mut impl Write, size: Size, status: &str) -> io::Resul
     let Ok(row) = u16::try_from(size.height.0 - 1) else {
         return Ok(());
     };
-    queue!(out, MoveTo(0, row))?;
+    write_command(out, MoveTo(0, row))?;
     out.write_all(status.as_bytes())?;
     Ok(())
 }

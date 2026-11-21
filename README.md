@@ -9,13 +9,19 @@ The smartlog is re-queried on that interval while it is open.
 When the diff output changes, the scroll position is kept and the
 current file header stays pinned.
 
+GitHub and Origin pull-request review and CI status are not fetched
+before the smartlog is drawn. They load in the background and the
+tree is repainted when they arrive. While the smartlog stays open
+that status is refreshed on its own interval.
+
 Sapling is used when the repository already has sl metadata (`.sl` or
 `.git/sl`). Otherwise the repository is treated as git.
 
 ## Features
 
 - Smartlog (`t`), drawn from `sl smartlog` and refreshed while open,
-  with GitHub or Origin PR links and review/CI status
+  with GitHub or Origin PR links; review and CI status load in the
+  background
 - Live working-copy diff that keeps the scroll position
 - Commit view (`-c`, or Enter in the smartlog) and diff against the
   previous commit
