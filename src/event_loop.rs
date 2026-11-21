@@ -1,15 +1,20 @@
+use std::future;
 use std::io;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::task::AbortOnDropHandle;
@@ -58,6 +63,7 @@ use crate::theme::diff_note_style;
 use crate::util::mark::MarkOp;
 use crate::util::mark::Marks;
 use crate::util::mark::NOT_SET;
+use crate::util::notify_pair::NotifyRx;
 use crate::util::notify_pair::NotifyTx;
 use crate::util::time::ts_secs::TimestampsSecs;
 
@@ -145,6 +151,14 @@ pub(crate) struct EventLoop {
     smartlog_from_files: bool,
     /// View to open after the first diff snapshot is applied.
     start_view: StartView,
+    /// Set while the smartlog (or its help page) is open so the poll
+    /// loop re-queries. Cleared when that view is left.
+    smartlog_live: Arc<AtomicBool>,
+    /// Bumped on each synchronous smartlog fetch so an in-flight poll
+    /// cannot overwrite a newer `r` / open result.
+    smartlog_epoch: Arc<AtomicU64>,
+    smartlog_wake_tx: NotifyTx,
+    smartlog_wake_rx: Option<NotifyRx>,
 }
 
 impl EventLoop {
@@ -157,6 +171,7 @@ impl EventLoop {
         tool: Option<DiffTool>,
         start_view: StartView,
     ) -> EventLoop {
+        let (smartlog_wake_tx, smartlog_wake_rx) = NotifyTx::pair();
         EventLoop {
             renderer: Renderer::new(terminal_bg, size),
             help_renderer: Renderer::new(terminal_bg, size),
@@ -175,6 +190,10 @@ impl EventLoop {
             smartlog_sel: None,
             smartlog_from_files: false,
             start_view,
+            smartlog_live: Arc::new(AtomicBool::new(false)),
+            smartlog_epoch: Arc::new(AtomicU64::new(0)),
+            smartlog_wake_tx,
+            smartlog_wake_rx: Some(smartlog_wake_rx),
         }
     }
 
@@ -185,9 +204,17 @@ impl EventLoop {
         keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
+        interval: Duration,
     ) -> anyhow::Result<()> {
         let result = self
-            .drive(first_lines, output_rx, keys, refresh_tx, capture_task)
+            .drive(
+                first_lines,
+                output_rx,
+                keys,
+                refresh_tx,
+                capture_task,
+                interval,
+            )
             .await;
         self.history.shutdown().await;
         result
@@ -200,7 +227,26 @@ impl EventLoop {
         mut keys: UnboundedReceiver<io::Result<Event>>,
         refresh_tx: NotifyTx,
         capture_task: AbortOnDropHandle<()>,
+        interval: Duration,
     ) -> anyhow::Result<()> {
+        let mut smartlog_rx = None;
+        let _smartlog_task = match mem::take(&mut self.smartlog_wake_rx) {
+            Some(wake) if self.tool == Some(DiffTool::Sl) => {
+                let (tx, rx) = mpsc::channel(1);
+                smartlog_rx = Some(rx);
+                Some(AbortOnDropHandle::new(tokio::spawn(smartlog_poll_loop(
+                    Arc::clone(&self.smartlog_live),
+                    Arc::clone(&self.smartlog_epoch),
+                    wake,
+                    interval,
+                    tx,
+                ))))
+            }
+            wake => {
+                self.smartlog_wake_rx = wake;
+                None
+            }
+        };
         self.on_command_output(first_lines)?;
         self.open_start_view()?;
         loop {
@@ -212,6 +258,14 @@ impl EventLoop {
                         return Ok(());
                     };
                     self.on_command_output(output)?;
+                }
+                poll = recv_smartlog_poll(&mut smartlog_rx) => {
+                    match poll {
+                        Some(msg) => self.on_smartlog_poll(msg)?,
+                        None => {
+                            smartlog_rx = None;
+                        }
+                    }
                 }
                 event = keys.recv() => {
                     let Some(event) = event else {
@@ -624,18 +678,23 @@ impl EventLoop {
         } else {
             "Enter: go to file"
         };
+        let mode = self.spec.lock().unwrap().mode_status();
         if !force {
             let same_lines = self.help_renderer.lines() == lines.as_slice();
             let same_label = self.help_renderer.status_label() == Some(hint);
+            let same_mode = self.help_renderer.status_mode() == Some(mode.as_str());
             if same_lines {
                 if same_label {
-                    return Ok(());
+                    if same_mode {
+                        return Ok(());
+                    }
                 }
             }
         }
         self.help_renderer.set_lines(lines);
         self.help_renderer
             .set_status_label(Some(String::from(hint)));
+        self.help_renderer.set_status_mode(Some(mode));
         let row = file_list_description_rows(&description).saturating_add(self.file_list_index);
         self.help_renderer.ensure_line_visible(row);
         if force {
@@ -698,6 +757,7 @@ impl EventLoop {
                 };
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_label(None);
+                self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
@@ -811,15 +871,19 @@ impl EventLoop {
         if !force {
             let same_lines = self.help_renderer.lines() == lines.as_slice();
             let same_label = self.help_renderer.status_label() == Some(hint);
+            let same_mode = self.help_renderer.status_mode().is_none();
             if same_lines {
                 if same_label {
-                    return Ok(());
+                    if same_mode {
+                        return Ok(());
+                    }
                 }
             }
         }
         self.help_renderer.set_lines(lines);
         self.help_renderer
             .set_status_label(Some(String::from(hint)));
+        self.help_renderer.set_status_mode(None);
         self.help_renderer.ensure_line_visible(self.diff_mode_index);
         if force {
             self.help_renderer.redraw(&mut io::stdout())?;
@@ -883,6 +947,7 @@ impl EventLoop {
                 };
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_label(None);
+                self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
@@ -983,6 +1048,56 @@ impl EventLoop {
         SmartlogSelection::at(view, i)
     }
 
+    fn enable_smartlog_poll(&self) {
+        let was = self.smartlog_live.swap(true, Ordering::SeqCst);
+        if !was {
+            self.smartlog_wake_tx.notify_one();
+        }
+    }
+
+    fn disable_smartlog_poll(&self) {
+        let was = self.smartlog_live.swap(false, Ordering::SeqCst);
+        if was {
+            self.smartlog_wake_tx.notify_one();
+        }
+    }
+
+    fn on_smartlog_poll(&mut self, msg: SmartlogPollMsg) -> anyhow::Result<()> {
+        if msg.epoch != self.smartlog_epoch.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if !self.smartlog_live.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let keep_offset = match (&self.smartlog, self.smartlog_sel.as_ref()) {
+            (Some(old), Some(sel)) => sel.resolve(old).map(|index| {
+                (
+                    commit_header_row(old, index),
+                    self.help_renderer.top_line_index(),
+                )
+            }),
+            _ => None,
+        };
+        let next_sel = match &self.smartlog_sel {
+            Some(sel) => match sel.resolve(&msg.view) {
+                Some(index) => Some(SmartlogSelection {
+                    digest: sel.digest.clone(),
+                    index,
+                }),
+                None => {
+                    SmartlogSelection::at(&msg.view, current_commit_index(&msg.view).unwrap_or(0))
+                }
+            },
+            None => SmartlogSelection::at(&msg.view, current_commit_index(&msg.view).unwrap_or(0)),
+        };
+        self.smartlog_sel = next_sel;
+        self.smartlog = Some(msg.view);
+        if matches!(self.mode, Mode::Smartlog) {
+            self.paint_smartlog_scroll(false, keep_offset)?;
+        }
+        Ok(())
+    }
+
     fn open_smartlog(&mut self) -> anyhow::Result<KeyResult> {
         let from_files = match self.mode {
             Mode::Files => true,
@@ -1006,6 +1121,9 @@ impl EventLoop {
                 self.smartlog_sel = self.smartlog_open_selection(&view);
                 self.smartlog = Some(view);
                 self.mode = Mode::Smartlog;
+                // Drop any poll that started before this snapshot.
+                self.smartlog_epoch.fetch_add(1, Ordering::SeqCst);
+                self.enable_smartlog_poll();
                 self.paint_smartlog(true)?;
                 // Put the selected commit's header at the top.
                 if let Some(view) = &self.smartlog {
@@ -1034,6 +1152,7 @@ impl EventLoop {
     }
 
     fn close_smartlog(&mut self) -> anyhow::Result<KeyResult> {
+        self.disable_smartlog_poll();
         if self.smartlog_from_files {
             self.smartlog_from_files = false;
             self.mode = Mode::Files;
@@ -1046,6 +1165,18 @@ impl EventLoop {
     }
 
     fn paint_smartlog(&mut self, force: bool) -> anyhow::Result<()> {
+        self.paint_smartlog_scroll(force, None)
+    }
+
+    /// `keep_offset` is `(selected header row, viewport top line)` from
+    /// before a poll replaced the view. The new selection stays at that
+    /// distance from the top so an inserted commit does not jump the
+    /// page, and a ^e/^y scroll away from the cursor is kept.
+    fn paint_smartlog_scroll(
+        &mut self,
+        force: bool,
+        keep_offset: Option<(usize, usize)>,
+    ) -> anyhow::Result<()> {
         let Some(view) = &self.smartlog else {
             return Ok(());
         };
@@ -1060,17 +1191,29 @@ impl EventLoop {
         if !force {
             let same_lines = self.help_renderer.lines() == lines.as_slice();
             let same_label = self.help_renderer.status_label() == Some(hint.as_str());
+            let same_mode = self.help_renderer.status_mode().is_none();
             if same_lines {
                 if same_label {
-                    return Ok(());
+                    if same_mode {
+                        return Ok(());
+                    }
                 }
             }
         }
         self.help_renderer.set_lines(lines);
         self.help_renderer.set_status_label(Some(hint));
+        self.help_renderer.set_status_mode(None);
         if let Some(index) = self.smartlog_sel.as_ref().and_then(|sel| sel.resolve(view)) {
             let row = commit_header_row(view, index);
-            self.help_renderer.ensure_line_visible(row);
+            match keep_offset {
+                Some((old_row, old_top)) => {
+                    let top = smartlog_top_for_offset(old_row, old_top, row);
+                    self.help_renderer.scroll_to_line(top);
+                }
+                None => {
+                    self.help_renderer.ensure_line_visible(row);
+                }
+            }
         }
         if force {
             self.help_renderer.redraw(&mut io::stdout())?;
@@ -1144,6 +1287,7 @@ impl EventLoop {
             *slot = spec;
         }
         self.sync_status_mode();
+        self.disable_smartlog_poll();
         self.smartlog_from_files = false;
         self.mode = Mode::Output;
         self.search.clear_match();
@@ -1194,6 +1338,7 @@ impl EventLoop {
                 };
                 self.help_renderer.set_lines(help_lines());
                 self.help_renderer.set_status_label(None);
+                self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
@@ -1395,6 +1540,7 @@ impl EventLoop {
                     back: HelpBack::Output,
                 };
                 self.help_renderer.set_lines(help_lines());
+                self.help_renderer.set_status_mode(None);
                 self.help_renderer.scroll_top();
                 self.help_renderer.redraw(&mut io::stdout())?;
                 Ok(KeyResult::Continue)
@@ -1474,6 +1620,71 @@ fn show_search_outcome(
     }
     renderer.redraw(&mut io::stdout())?;
     Ok(())
+}
+
+/// One smartlog snapshot from the background poll, tagged with the
+/// epoch observed when the fetch started.
+struct SmartlogPollMsg {
+    epoch: u64,
+    view: SmartlogView,
+}
+
+async fn recv_smartlog_poll(rx: &mut Option<Receiver<SmartlogPollMsg>>) -> Option<SmartlogPollMsg> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => future::pending().await,
+    }
+}
+
+/// Re-query `sl smartlog` on `interval` while `live` is set.
+async fn smartlog_poll_loop(
+    live: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    wake: NotifyRx,
+    interval: Duration,
+    tx: mpsc::Sender<SmartlogPollMsg>,
+) {
+    loop {
+        if !live.load(Ordering::SeqCst) {
+            wake.notified().await;
+            continue;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = wake.notified() => {
+                continue;
+            }
+        }
+        if !live.load(Ordering::SeqCst) {
+            continue;
+        }
+        let seen = epoch.load(Ordering::SeqCst);
+        let view = match tokio::task::spawn_blocking(fetch_smartlog).await {
+            Ok(Ok(view)) => view,
+            Ok(Err(_)) => continue,
+            Err(_) => continue,
+        };
+        if !live.load(Ordering::SeqCst) {
+            continue;
+        }
+        if epoch.load(Ordering::SeqCst) != seen {
+            continue;
+        }
+        let msg = SmartlogPollMsg { epoch: seen, view };
+        if tx.send(msg).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Viewport top that keeps the selected header at the same offset
+/// after its row index changes.
+fn smartlog_top_for_offset(old_row: usize, old_top: usize, new_row: usize) -> usize {
+    if old_top >= old_row {
+        new_row.saturating_add(old_top - old_row)
+    } else {
+        new_row.saturating_sub(old_row - old_top)
+    }
 }
 
 /// Status-bar text for Enter on the selected smartlog row: the diff
@@ -1738,6 +1949,7 @@ mod tests {
     use crate::capture::DiffViewKind;
     use crate::event_loop::diff_mode_lines;
     use crate::event_loop::smartlog_enter_hint;
+    use crate::event_loop::smartlog_top_for_offset;
     use crate::repo::digest::CommitDigest;
     use crate::repo::repo::DiffTool;
     use crate::repo::sl::smartlog::SmartlogCommit;
@@ -1767,6 +1979,14 @@ mod tests {
             date_unix: TimestampsSecs(0),
             current,
         }
+    }
+
+    #[test]
+    fn test_smartlog_top_for_offset_keeps_selection_delta() {
+        assert_eq!(12, smartlog_top_for_offset(10, 8, 14));
+        assert_eq!(14, smartlog_top_for_offset(10, 10, 14));
+        assert_eq!(16, smartlog_top_for_offset(10, 12, 14));
+        assert_eq!(0, smartlog_top_for_offset(5, 0, 2));
     }
 
     #[test]

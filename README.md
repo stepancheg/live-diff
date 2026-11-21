@@ -5,15 +5,16 @@ smartlog, a live working-copy diff, and a single commit or pull
 request, in one pager.
 
 While an agent is editing the tree, the diff is re-run on an interval.
-When the output changes, the scroll position is kept and the current
-file header stays pinned.
+The smartlog is re-queried on that interval while it is open.
+When the diff output changes, the scroll position is kept and the
+current file header stays pinned.
 
 Sapling is used when the repository already has sl metadata (`.sl` or
 `.git/sl`). Otherwise the repository is treated as git.
 
 ## Features
 
-- Smartlog (`t`), drawn from `sl smartlog`, with GitHub or Origin PR links
+- Smartlog (`t`), drawn from `sl smartlog` and refreshed while open, with GitHub or Origin PR links
 - Live working-copy diff that keeps the scroll position
 - Commit view (`-c`, or Enter in the smartlog) and diff against the previous commit
 - Git and Sapling

@@ -193,7 +193,14 @@ async fn main() -> anyhow::Result<()> {
         menu_tool,
         start_view,
     )
-    .run(first_lines, output_rx, keys, refresh_tx, capture_task)
+    .run(
+        first_lines,
+        output_rx,
+        keys,
+        refresh_tx,
+        capture_task,
+        args.interval.as_duration(),
+    )
     .await
 }
 

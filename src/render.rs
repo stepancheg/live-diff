@@ -182,6 +182,10 @@ impl Renderer {
         self.status_mode = mode;
     }
 
+    pub(crate) fn status_mode(&self) -> Option<&str> {
+        self.status_mode.as_deref()
+    }
+
     /// Right-hand status cluster: optional mode, optional note, and the
     /// ruler. The note is dropped first when the cluster would not fit;
     /// the mode is dropped after that.
